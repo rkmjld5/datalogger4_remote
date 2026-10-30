@@ -1,281 +1,271 @@
 <?php
 /*
- * ESP32 Data Logger 4 Remote
+ * Data Logger remote configuration for Render + TiDB Cloud.
  *
- * Endpoint: /sync_sdcard.php
+ * Database settings are read from Render environment variables.
+ * A local .env file is supported for local development.
  *
- * Receives records from the ESP32 SD CSV file.
- *
- * POST fields:
- * api_token, csv_id, value1, value2, value3,
- * Date, Time, TimeStamp, timezone, device_id
- *
- * Database: espdemo2
- * Table: logs
- *
- * Database columns:
- * id, value1, value2, value3, Date, Time,
- * TimeStamp, timezone, device_id
+ * IMPORTANT:
+ * Never commit real database passwords to GitHub.
  */
 
-header('Content-Type: application/json; charset=UTF-8');
-header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
+date_default_timezone_set('Asia/Kolkata');
 
-require_once __DIR__ . '/config.php';
+/* ---------------------------------------------------------
+   1. Read a local .env file when available.
+   Render environment variables take precedence.
+   --------------------------------------------------------- */
 
-function syncRespond(int $status, array $data): void
-{
-    http_response_code($status);
-    echo json_encode(
-        $data,
-        JSON_UNESCAPED_SLASHES | JSON_PRETTY_PRINT
+$envFile = __DIR__ . '/.env';
+
+if (is_file($envFile) && is_readable($envFile)) {
+
+    $envLines = file(
+        $envFile,
+        FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES
     );
-    exit;
+
+    if ($envLines !== false) {
+
+        foreach ($envLines as $envLine) {
+
+            $envLine = trim($envLine);
+
+            if (
+                $envLine === '' ||
+                str_starts_with($envLine, '#') ||
+                !str_contains($envLine, '=')
+            ) {
+                continue;
+            }
+
+            [$envKey, $envValue] = explode('=', $envLine, 2);
+
+            $envKey = trim($envKey);
+            $envValue = trim($envValue);
+
+            if (strlen($envValue) >= 2) {
+
+                $first = $envValue[0];
+                $last = $envValue[strlen($envValue) - 1];
+
+                if (
+                    ($first === '"' && $last === '"') ||
+                    ($first === "'" && $last === "'")
+                ) {
+                    $envValue = substr($envValue, 1, -1);
+                }
+            }
+
+            // Do not override an existing process environment variable.
+            if ($envKey !== '' && getenv($envKey) === false) {
+
+                putenv($envKey . '=' . $envValue);
+
+                $_ENV[$envKey] = $envValue;
+            }
+        }
+    }
 }
+
+/* ---------------------------------------------------------
+   2. Secure PHP session configuration.
+   --------------------------------------------------------- */
+
+if (session_status() === PHP_SESSION_NONE) {
+
+    $httpsIsOn = (
+        (
+            !empty($_SERVER['HTTPS']) &&
+            strtolower((string)$_SERVER['HTTPS']) !== 'off'
+        ) ||
+        (
+            isset($_SERVER['HTTP_X_FORWARDED_PROTO']) &&
+            strtolower(
+                (string)$_SERVER['HTTP_X_FORWARDED_PROTO']
+            ) === 'https'
+        )
+    );
+
+    session_set_cookie_params([
+        'httponly' => true,
+        'secure' => $httpsIsOn,
+        'samesite' => 'Lax'
+    ]);
+
+    session_start();
+}
+
+/* ---------------------------------------------------------
+   3. Enable MySQLi error reporting.
+   --------------------------------------------------------- */
+
+mysqli_report(
+    MYSQLI_REPORT_ERROR | MYSQLI_REPORT_STRICT
+);
+
+/* ---------------------------------------------------------
+   4. Environment variable helper.
+   --------------------------------------------------------- */
+
+if (!function_exists('dataLoggerEnv')) {
+
+    function dataLoggerEnv(
+        string $key,
+        string $default = ''
+    ): string {
+
+        $value = getenv($key);
+
+        return $value === false
+            ? $default
+            : trim((string)$value);
+    }
+}
+
+/* ---------------------------------------------------------
+   5. Database configuration.
+   --------------------------------------------------------- */
+
+$servername = dataLoggerEnv('DB_HOST', 'localhost');
+
+$dbUsername = dataLoggerEnv('DB_USER', 'root');
+
+$dbPassword = dataLoggerEnv('DB_PASSWORD', '');
+
+$dbname = dataLoggerEnv('DB_NAME', 'espdemo2');
+
+$dbport = (int)dataLoggerEnv('DB_PORT', '3306');
+
+$dbSslCa = dataLoggerEnv(
+    'DB_SSL_CA',
+    '/etc/ssl/certs/ca-certificates.crt'
+);
+
+/* ---------------------------------------------------------
+   6. Connect to MySQL or TiDB Cloud.
+   --------------------------------------------------------- */
 
 try {
 
-    // 1. Accept POST requests only.
-    if (($_SERVER['REQUEST_METHOD'] ?? '') !== 'POST') {
-        header('Allow: POST');
-
-        syncRespond(405, [
-            'status' => 'error',
-            'message' => 'POST request required.'
-        ]);
-    }
-
-    // 2. Read and validate device credentials.
-    $deviceID = trim((string)($_POST['device_id'] ?? ''));
-    $apiToken = trim((string)($_POST['api_token'] ?? ''));
-
     if (
-        $deviceID === '' ||
-        $apiToken === '' ||
-        !preg_match('/^[A-Za-z0-9_-]{1,32}$/', $deviceID)
+        $servername === '' ||
+        $dbUsername === '' ||
+        $dbname === '' ||
+        $dbport < 1 ||
+        $dbport > 65535
     ) {
-        syncRespond(400, [
-            'status' => 'error',
-            'message' => 'Missing or invalid device credentials.'
-        ]);
-    }
 
-    // 3. Verify the registered ESP device.
-    $stmt = $conn->prepare(
-        'SELECT token_hash, enabled
-         FROM esp_devices
-         WHERE device_id = ?
-         LIMIT 1'
-    );
-
-    if (!$stmt) {
         throw new RuntimeException(
-            'Could not prepare device authentication query.'
+            'Required database settings are missing or invalid.'
         );
     }
 
-    $stmt->bind_param('s', $deviceID);
+    $conn = mysqli_init();
 
-    if (!$stmt->execute()) {
+    if (!$conn) {
+
         throw new RuntimeException(
-            'Device authentication query failed.'
+            'Unable to initialize MySQL connection.'
         );
     }
 
-    $result = $stmt->get_result();
-    $device = $result->fetch_assoc();
-    $stmt->close();
-
-    $storedHash = is_array($device)
-        ? (string)($device['token_hash'] ?? '')
-        : '';
-
-    $submittedHash = hash('sha256', $apiToken);
-
-    if (
-        !$device ||
-        (int)($device['enabled'] ?? 0) !== 1 ||
-        $storedHash === '' ||
-        !hash_equals($storedHash, $submittedHash)
-    ) {
-        syncRespond(403, [
-            'status' => 'error',
-            'message' => 'Device is not authorized.'
-        ]);
-    }
-
-    // 4. Read the original SD CSV record.
-    $csvID = trim((string)($_POST['csv_id'] ?? ''));
-
-    $value1 = trim((string)($_POST['value1'] ?? ''));
-    $value2 = trim((string)($_POST['value2'] ?? ''));
-    $value3 = trim((string)($_POST['value3'] ?? ''));
-
-    $date = trim((string)($_POST['Date'] ?? ''));
-    $time = trim((string)($_POST['Time'] ?? ''));
-    $timestamp = trim((string)($_POST['TimeStamp'] ?? ''));
-    $timezone = trim((string)($_POST['timezone'] ?? ''));
-
-    // 5. Validate the CSV ID.
-    if ($csvID === '' || !ctype_digit($csvID)) {
-        syncRespond(400, [
-            'status' => 'error',
-            'message' => 'Invalid csv_id.'
-        ]);
-    }
-
-    // 6. Validate sensor values and field lengths.
-    if (
-        $value1 === '' ||
-        $value2 === '' ||
-        $value3 === '' ||
-        strlen($value1) > 30 ||
-        strlen($value2) > 30 ||
-        strlen($value3) > 50
-    ) {
-        syncRespond(400, [
-            'status' => 'error',
-            'message' => 'Missing sensor values or field length exceeded.'
-        ]);
-    }
-
-    // 7. Validate Date, Time and TimeStamp formats.
-    $validDate = DateTimeImmutable::createFromFormat(
-        '!Y-m-d',
-        $date
+    $conn->options(
+        MYSQLI_OPT_CONNECT_TIMEOUT,
+        15
     );
 
-    if (
-        !$validDate ||
-        $validDate->format('Y-m-d') !== $date
-    ) {
-        syncRespond(400, [
-            'status' => 'error',
-            'message' => 'Invalid Date. Expected YYYY-MM-DD.'
-        ]);
-    }
-
-    if (
-        !preg_match(
-            '/^(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d$/',
-            $time
-        )
-    ) {
-        syncRespond(400, [
-            'status' => 'error',
-            'message' => 'Invalid Time. Expected HH:MM:SS.'
-        ]);
-    }
-
-    $validTimestamp = DateTimeImmutable::createFromFormat(
-        '!Y-m-d H:i:s',
-        $timestamp
+    $isRemoteDatabase = !in_array(
+        strtolower($servername),
+        ['localhost', '127.0.0.1', '::1'],
+        true
     );
 
-    if (
-        !$validTimestamp ||
-        $validTimestamp->format('Y-m-d H:i:s') !== $timestamp
-    ) {
-        syncRespond(400, [
-            'status' => 'error',
-            'message' => 'Invalid TimeStamp. Expected YYYY-MM-DD HH:MM:SS.'
-        ]);
-    }
+    if ($isRemoteDatabase) {
 
-    // 8. Validate the installation timezone.
-    if (
-        $timezone === '' ||
-        strlen($timezone) > 64 ||
-        !in_array(
-            $timezone,
-            DateTimeZone::listIdentifiers(),
-            true
-        )
-    ) {
-        syncRespond(400, [
-            'status' => 'error',
-            'message' => 'Invalid installation timezone.'
-        ]);
-    }
+        /*
+         * Remote TiDB Cloud connection.
+         * TLS encryption is enabled.
+         */
 
-    // 9. Insert the record into the remote TiDB Cloud database.
-    //
-    // The database generates its own id.
-    // csv_id is the local SD CSV ID, not the database primary key.
-    //
-    // This assumes config.php connects to the correct TiDB Cloud
-    // database and the logs.id column is AUTO_INCREMENT.
+        if (defined('MYSQLI_OPT_SSL_VERIFY_SERVER_CERT')) {
 
-    $stmt = $conn->prepare(
-        'INSERT INTO logs
-            (value1, value2, value3, `Date`, `Time`,
-             `TimeStamp`, timezone, device_id)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
-    );
+            $conn->options(
+                MYSQLI_OPT_SSL_VERIFY_SERVER_CERT,
+                true
+            );
+        }
 
-    if (!$stmt) {
-        throw new RuntimeException(
-            'Could not prepare logs insertion.'
+        $caFile = (
+            $dbSslCa !== '' &&
+            is_readable($dbSslCa)
+        ) ? $dbSslCa : null;
+
+        $conn->ssl_set(
+            null,
+            null,
+            $caFile,
+            null,
+            null
+        );
+
+        $conn->real_connect(
+            $servername,
+            $dbUsername,
+            $dbPassword,
+            $dbname,
+            $dbport,
+            null,
+            MYSQLI_CLIENT_SSL
+        );
+
+    } else {
+
+        /*
+         * Local XAMPP connection.
+         */
+
+        $conn->real_connect(
+            $servername,
+            $dbUsername,
+            $dbPassword,
+            $dbname,
+            $dbport
         );
     }
 
-    $stmt->bind_param(
-        'ssssssss',
-        $value1,
-        $value2,
-        $value3,
-        $date,
-        $time,
-        $timestamp,
-        $timezone,
-        $deviceID
-    );
-
-    if (!$stmt->execute()) {
-        $error = $stmt->error;
-        $stmt->close();
-
-        error_log(
-            'SD sync database insert failed: ' . $error
-        );
-
-        syncRespond(500, [
-            'status' => 'error',
-            'message' => 'Database insertion failed.',
-            'csv_id' => $csvID,
-            'device_id' => $deviceID
-        ]);
-    }
-
-    $databaseID = $stmt->insert_id;
-    $stmt->close();
-
-    // 10. Return success only after a successful insertion.
-    syncRespond(200, [
-        'status' => 'success',
-        'message' => 'SD record inserted into espdemo2.logs.',
-        'csv_id' => $csvID,
-        'database_id' => $databaseID,
-        'device_id' => $deviceID,
-        'value1' => $value1,
-        'value2' => $value2,
-        'value3' => $value3,
-        'Date' => $date,
-        'Time' => $time,
-        'TimeStamp' => $timestamp,
-        'timezone' => $timezone,
-        'database_saved' => true
-    ]);
+    $conn->set_charset('utf8mb4');
 
 } catch (Throwable $e) {
 
     error_log(
-        'datalogger4_remote sync_sdcard.php: ' .
+        'Data Logger database connection failed: ' .
         $e->getMessage()
     );
 
-    syncRespond(500, [
-        'status' => 'error',
-        'message' => 'Server or database error. Check Render logs.'
-    ]);
+    http_response_code(500);
+
+    exit(
+        'Database connection failed. Please check the ' .
+        'Render Environment settings and TiDB Cloud ' .
+        'connection permissions.'
+    );
 }
+
+/* ---------------------------------------------------------
+   7. HTML output escaping helper.
+   --------------------------------------------------------- */
+
+if (!function_exists('h')) {
+
+    function h($value): string {
+
+        return htmlspecialchars(
+            (string)($value ?? ''),
+            ENT_QUOTES,
+            'UTF-8'
+        );
+    }
+}
+
+?>
