@@ -5,7 +5,7 @@
  *
  * Endpoint: /save3_csv.php
  *
- * Receives live sensor records from ESP32.
+ * Live ESP32 sensor upload to TiDB Cloud.
  *
  * POST fields:
  * device_id, api_token, value1, value2, value3,
@@ -14,13 +14,18 @@
  * Database: espdemo2
  * Table: logs
  *
- * Uses config.php for the TiDB Cloud connection.
+ * Date and Time = installation-local time.
+ * TimeStamp = UTC.
  */
+
+// IMPORTANT:
+// Load config.php BEFORE sending HTTP headers.
+// config.php may configure and start a PHP session.
+
+require_once __DIR__ . '/config.php';
 
 header('Content-Type: application/json; charset=UTF-8');
 header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
-
-require_once __DIR__ . '/config.php';
 
 function saveRespond(int $status, array $data): void
 {
@@ -36,7 +41,7 @@ function saveRespond(int $status, array $data): void
 
 try {
 
-    // 1. Accept POST requests only.
+    // 1. POST requests only.
 
     if (($_SERVER['REQUEST_METHOD'] ?? '') !== 'POST') {
 
@@ -48,7 +53,7 @@ try {
         ]);
     }
 
-    // 2. Read device credentials.
+    // 2. Read credentials.
 
     $deviceID = trim((string)($_POST['device_id'] ?? ''));
     $apiToken = trim((string)($_POST['api_token'] ?? ''));
@@ -64,7 +69,7 @@ try {
         ]);
     }
 
-    // 3. Verify the registered ESP device.
+    // 3. Verify registered ESP device.
 
     $stmt = $conn->prepare(
         'SELECT token_hash, enabled
@@ -110,7 +115,7 @@ try {
         ]);
     }
 
-    // 4. Read sensor values and timestamp.
+    // 4. Read sensor values.
 
     $value1 = trim((string)($_POST['value1'] ?? ''));
     $value2 = trim((string)($_POST['value2'] ?? ''));
@@ -156,7 +161,7 @@ try {
         ]);
     }
 
-    // 7. Validate installation timezone.
+    // 7. Validate timezone.
 
     if (
         $timezone === '' ||
@@ -175,7 +180,7 @@ try {
 
     $tz = new DateTimeZone($timezone);
 
-    // 8. Convert Unix timestamp into installation-local date/time.
+    // 8. Convert Unix UTC timestamp to installation-local time.
 
     $localDateTime = (
         new DateTimeImmutable('@' . $unixTimestamp)
@@ -184,18 +189,16 @@ try {
     $date = $localDateTime->format('Y-m-d');
     $time = $localDateTime->format('H:i:s');
 
-    // Store TimeStamp in UTC, as in the existing CSV endpoint.
+    // 9. Keep TimeStamp in UTC.
 
     $timestampUTC = gmdate(
         'Y-m-d H:i:s',
         $unixTimestamp
     );
 
-    // 9. Insert live record into TiDB Cloud.
-    //
-    // $conn comes from config.php.
+    // 10. Insert record into TiDB Cloud.
+    // Uses the $conn connection from config.php.
     // No localhost/root connection is used.
-    // Database generates its own logs.id.
 
     $stmt = $conn->prepare(
         'INSERT INTO logs
@@ -242,7 +245,7 @@ try {
 
     $stmt->close();
 
-    // 10. Report success only after database insertion.
+    // 11. Return success.
 
     saveRespond(200, [
         'status' => 'success',
