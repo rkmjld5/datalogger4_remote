@@ -1,107 +1,380 @@
 <?php
+/*
+ * ESP32 Data Logger 4 Remote
+ *
+ * Endpoint: /sync_littleFS.php
+ *
+ * Receives one 9-column record from ESP32 LittleFS sensor_data.csv
+ * and inserts it into TiDB Cloud database espdemo2.logs.
+ *
+ * POST fields:
+ * api_token, csv_id, value1, value2, value3,
+ * Date, Time, TimeStamp, timezone, device_id
+ *
+ * Time convention:
+ * Date and Time = installation-local time.
+ * TimeStamp = UTC, in YYYY-MM-DD HH:MM:SS format.
+ *
+ * Duplicate protection:
+ * device_id + TimeStamp.
+ *
+ * IMPORTANT:
+ * Save this file as UTF-8 WITHOUT BOM.
+ * The opening <?php must be the first bytes in the file.
+ */
+
+// Load the same Render/TiDB connection used by the working sync_sdcard.php.
+// config.php must provide $conn and connect to espdemo2.
 require_once __DIR__ . '/config.php';
-date_default_timezone_set('Asia/Kolkata');
 
-if (empty($_SESSION['admin_login_csrf'])) {
-    $_SESSION['admin_login_csrf'] = bin2hex(random_bytes(32));
-}
-$error = (string)($_SESSION['admin_login_error'] ?? '');
-$reason = (string)($_SESSION['admin_login_failure_reason'] ?? '');
-$validFrom = (string)($_SESSION['admin_login_valid_from'] ?? '');
-$validUntil = (string)($_SESSION['admin_login_valid_until'] ?? '');
-unset($_SESSION['admin_login_error'], $_SESSION['admin_login_failure_reason'], $_SESSION['admin_login_valid_from'], $_SESSION['admin_login_valid_until']);
+header('Content-Type: application/json; charset=UTF-8');
+header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
 
-function ownerLoginFail(string $message, string $reason = '', ?string $validFrom = null, ?string $validUntil = null): void {
-    unset(
-        $_SESSION['user_id'], $_SESSION['username'], $_SESSION['role'], $_SESSION['device_id'],
-        $_SESSION['consumer_authenticated'], $_SESSION['admin_authenticated'],
-        $_SESSION['esp_current_datetime'], $_SESSION['esp_timezone']
+function littleFsRespond(int $status, array $data): void
+{
+    http_response_code($status);
+
+    echo json_encode(
+        $data,
+        JSON_UNESCAPED_SLASHES | JSON_PRETTY_PRINT
     );
-    $_SESSION['admin_login_error'] = $message;
-    $_SESSION['admin_login_failure_reason'] = $reason;
-    $_SESSION['admin_login_valid_from'] = $validFrom ?? '';
-    $_SESSION['admin_login_valid_until'] = $validUntil ?? '';
-    $_SESSION['admin_login_csrf'] = bin2hex(random_bytes(32));
-    header('Location: owner.php');
+
     exit;
 }
 
-if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    if (!hash_equals((string)($_SESSION['admin_login_csrf'] ?? ''), (string)($_POST['csrf_token'] ?? ''))) {
-        ownerLoginFail('Security check failed. Please reload the Administrator Login page and try again.');
-    }
-    $username = trim((string)($_POST['username'] ?? ''));
-    $password = (string)($_POST['password'] ?? '');
-    if ($username === '' || $password === '') {
-        ownerLoginFail('Please enter the administrator username and password.');
+try {
+
+    // 1. POST only.
+
+    if (($_SERVER['REQUEST_METHOD'] ?? '') !== 'POST') {
+        header('Allow: POST');
+
+        littleFsRespond(405, [
+            'status' => 'error',
+            'message' => 'POST request required.'
+        ]);
     }
 
-    try {
-        $stmt = $conn->prepare(
-            'SELECT id, username, password_hash, role, enabled, valid_from, valid_until
-             FROM web_users WHERE username = ? LIMIT 1'
+    // 2. Read credentials.
+
+    $deviceID = trim((string)($_POST['device_id'] ?? ''));
+    $apiToken = trim((string)($_POST['api_token'] ?? ''));
+
+    if (
+        $deviceID === '' ||
+        $apiToken === '' ||
+        !preg_match('/^[A-Za-z0-9_-]{1,32}$/', $deviceID)
+    ) {
+        littleFsRespond(400, [
+            'status' => 'error',
+            'message' => 'Missing or invalid device credentials.'
+        ]);
+    }
+
+    // 3. Authenticate against esp_devices, exactly like sync_sdcard.php.
+
+    $stmt = $conn->prepare(
+        'SELECT token_hash, enabled
+         FROM esp_devices
+         WHERE device_id = ?
+         LIMIT 1'
+    );
+
+    if (!$stmt) {
+        throw new RuntimeException(
+            'Could not prepare device authentication query.'
         );
-        $stmt->bind_param('s', $username);
-        $stmt->execute();
-        $stmt->bind_result($id, $savedUsername, $passwordHash, $role, $enabled, $dbValidFrom, $dbValidUntil);
-        $found = $stmt->fetch();
+    }
+
+    $stmt->bind_param('s', $deviceID);
+
+    if (!$stmt->execute()) {
+        throw new RuntimeException(
+            'Device authentication query failed.'
+        );
+    }
+
+    $result = $stmt->get_result();
+    $device = $result->fetch_assoc();
+    $stmt->close();
+
+    $storedHash = is_array($device)
+        ? (string)($device['token_hash'] ?? '')
+        : '';
+
+    $submittedHash = hash('sha256', $apiToken);
+
+    if (
+        !$device ||
+        (int)($device['enabled'] ?? 0) !== 1 ||
+        $storedHash === '' ||
+        !hash_equals($storedHash, $submittedHash)
+    ) {
+        littleFsRespond(403, [
+            'status' => 'error',
+            'message' => 'Device is not authorized.'
+        ]);
+    }
+
+    // 4. Read the local LittleFS CSV row.
+
+    $csvID = trim((string)($_POST['csv_id'] ?? ''));
+
+    $value1 = trim((string)($_POST['value1'] ?? ''));
+    $value2 = trim((string)($_POST['value2'] ?? ''));
+    $value3 = trim((string)($_POST['value3'] ?? ''));
+
+    $date = trim((string)($_POST['Date'] ?? ''));
+    $time = trim((string)($_POST['Time'] ?? ''));
+    $timestamp = trim((string)($_POST['TimeStamp'] ?? ''));
+    $timezone = trim((string)($_POST['timezone'] ?? ''));
+
+    // 5. Validate CSV ID.
+
+    if ($csvID === '' || !ctype_digit($csvID)) {
+        littleFsRespond(400, [
+            'status' => 'error',
+            'message' => 'Invalid csv_id.'
+        ]);
+    }
+
+    // 6. Validate values and database field lengths.
+
+    if (
+        $value1 === '' ||
+        $value2 === '' ||
+        $value3 === '' ||
+        strlen($value1) > 30 ||
+        strlen($value2) > 30 ||
+        strlen($value3) > 50 ||
+        strlen($deviceID) > 32
+    ) {
+        littleFsRespond(400, [
+            'status' => 'error',
+            'message' => 'Missing sensor values or field length exceeded.'
+        ]);
+    }
+
+    // 7. Validate local Date.
+
+    $validDate = DateTimeImmutable::createFromFormat('!Y-m-d', $date);
+
+    if (
+        !$validDate ||
+        $validDate->format('Y-m-d') !== $date
+    ) {
+        littleFsRespond(400, [
+            'status' => 'error',
+            'message' => 'Invalid Date. Expected YYYY-MM-DD.'
+        ]);
+    }
+
+    // 8. Validate local Time.
+
+    if (
+        !preg_match(
+            '/^(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d$/',
+            $time
+        )
+    ) {
+        littleFsRespond(400, [
+            'status' => 'error',
+            'message' => 'Invalid Time. Expected HH:MM:SS.'
+        ]);
+    }
+
+    // 9. Validate UTC TimeStamp.
+
+    $validTimestamp = DateTimeImmutable::createFromFormat(
+        '!Y-m-d H:i:s',
+        $timestamp,
+        new DateTimeZone('UTC')
+    );
+
+    if (
+        !$validTimestamp ||
+        $validTimestamp->format('Y-m-d H:i:s') !== $timestamp
+    ) {
+        littleFsRespond(400, [
+            'status' => 'error',
+            'message' => 'Invalid TimeStamp. Expected UTC YYYY-MM-DD HH:MM:SS.'
+        ]);
+    }
+
+    // 10. Validate installation timezone.
+
+    if (
+        $timezone === '' ||
+        strlen($timezone) > 64 ||
+        !in_array(
+            $timezone,
+            DateTimeZone::listIdentifiers(DateTimeZone::ALL_WITH_BC),
+            true
+        )
+    ) {
+        littleFsRespond(400, [
+            'status' => 'error',
+            'message' => 'Invalid installation timezone.'
+        ]);
+    }
+
+    // 11. Verify that Date and Time match the UTC timestamp converted
+    //     into the installation timezone. Do not alter the supplied values.
+
+    $installationTZ = new DateTimeZone($timezone);
+
+    $expectedLocal = $validTimestamp->setTimezone($installationTZ);
+
+    if (
+        $expectedLocal->format('Y-m-d') !== $date ||
+        $expectedLocal->format('H:i:s') !== $time
+    ) {
+        littleFsRespond(400, [
+            'status' => 'error',
+            'message' => 'Date/Time do not match the UTC TimeStamp and installation timezone.',
+            'received_Date' => $date,
+            'received_Time' => $time,
+            'expected_Date' => $expectedLocal->format('Y-m-d'),
+            'expected_Time' => $expectedLocal->format('H:i:s'),
+            'timezone' => $timezone
+        ]);
+    }
+
+    // 12. Use UTC for this database session.
+    // This is important if logs.TimeStamp is a TIMESTAMP column.
+    // If it is DATETIME, the supplied UTC text is stored unchanged.
+
+    if (!$conn->query("SET time_zone = '+00:00'")) {
+        throw new RuntimeException(
+            'Could not set database session timezone to UTC.'
+        );
+    }
+
+    // 13. Check for an existing record.
+    // Local CSV IDs can restart or differ between devices, so use
+    // device_id + UTC TimeStamp as the duplicate key.
+
+    $check = $conn->prepare(
+        'SELECT id
+         FROM logs
+         WHERE device_id = ?
+           AND `TimeStamp` = ?
+         LIMIT 1'
+    );
+
+    if (!$check) {
+        throw new RuntimeException(
+            'Could not prepare duplicate check.'
+        );
+    }
+
+    $check->bind_param('ss', $deviceID, $timestamp);
+
+    if (!$check->execute()) {
+        $check->close();
+
+        throw new RuntimeException(
+            'Duplicate check failed.'
+        );
+    }
+
+    $checkResult = $check->get_result();
+    $existing = $checkResult->fetch_assoc();
+
+    $check->close();
+
+    if ($existing) {
+        littleFsRespond(200, [
+            'status' => 'success',
+            'message' => 'Record already exists in espdemo2.logs; duplicate skipped.',
+            'csv_id' => $csvID,
+            'database_id' => (int)$existing['id'],
+            'device_id' => $deviceID,
+            'Date' => $date,
+            'Time' => $time,
+            'TimeStamp' => $timestamp,
+            'timezone' => $timezone,
+            'database_inserted' => false,
+            'already_in_database' => true,
+            'database_saved' => true
+        ]);
+    }
+
+    // 14. Insert the new record.
+    // The database generates its own id.
+    // csv_id remains the local LittleFS CSV ID only.
+
+    $stmt = $conn->prepare(
+        'INSERT INTO logs
+            (value1, value2, value3, `Date`, `Time`,
+             `TimeStamp`, timezone, device_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+    );
+
+    if (!$stmt) {
+        throw new RuntimeException(
+            'Could not prepare logs insertion.'
+        );
+    }
+
+    $stmt->bind_param(
+        'ssssssss',
+        $value1,
+        $value2,
+        $value3,
+        $date,
+        $time,
+        $timestamp,
+        $timezone,
+        $deviceID
+    );
+
+    if (!$stmt->execute()) {
+        $error = $stmt->error;
         $stmt->close();
 
-        if (!$found || !password_verify($password, (string)$passwordHash)) {
-            ownerLoginFail('Administrator login failed. Check your username and password.');
-        }
-        if ((string)$role !== 'admin') {
-            ownerLoginFail('This account is not an administrator account.', 'Consumer accounts must use Consumer Login.');
-        }
-        if ((int)$enabled !== 1) {
-            ownerLoginFail('Administrator login denied: this account is disabled.', 'Please contact the system owner.', $dbValidFrom, $dbValidUntil);
-        }
+        error_log('LittleFS TiDB insert failed: ' . $error);
 
-        $zone = new DateTimeZone('Asia/Kolkata');
-        $now = new DateTimeImmutable('now', $zone);
-        if ($dbValidFrom !== null && trim((string)$dbValidFrom) !== '') {
-            $start = new DateTimeImmutable((string)$dbValidFrom, $zone);
-            if ($now < $start) ownerLoginFail('Administrator login denied: the validity period has not started.', 'The validity period is shown below.', $dbValidFrom, $dbValidUntil);
-        }
-        if ($dbValidUntil !== null && trim((string)$dbValidUntil) !== '') {
-            $end = new DateTimeImmutable((string)$dbValidUntil, $zone);
-            if ($now > $end) ownerLoginFail('Administrator login denied: the validity period has expired.', 'The validity period is shown below.', $dbValidFrom, $dbValidUntil);
-        }
-
-        session_regenerate_id(true);
-        unset($_SESSION['consumer_authenticated']);
-        $_SESSION['admin_authenticated'] = true;
-        $_SESSION['user_id'] = (int)$id;
-        $_SESSION['username'] = (string)$savedUsername;
-        $_SESSION['role'] = 'admin';
-        $_SESSION['device_id'] = null;
-        $_SESSION['login_valid_from'] = $dbValidFrom ?? '';
-        $_SESSION['login_valid_until'] = $dbValidUntil ?? '';
-        $_SESSION['admin_login_csrf'] = bin2hex(random_bytes(32));
-        $_SESSION['consumer_login_csrf'] = bin2hex(random_bytes(32));
-        header('Location: index2.php');
-        exit;
-
-    } catch (Throwable $e) {
-        error_log('Administrator login error: ' . $e->getMessage());
-        ownerLoginFail('Administrator login could not be completed.', 'A database or date-time error occurred. Please check the PHP error log.');
+        littleFsRespond(500, [
+            'status' => 'error',
+            'message' => 'Database insertion failed.',
+            'csv_id' => $csvID,
+            'device_id' => $deviceID
+        ]);
     }
-}
 
-$adminSessionActive = (($_SESSION['role'] ?? '') === 'admin' && !empty($_SESSION['admin_authenticated']));
-function ownerDateText(string $v): string { return trim($v) === '' ? 'Not specified' : trim($v); }
-?>
-<!DOCTYPE html>
-<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Data Logger - Administrator Login</title>
-<style>
-*{box-sizing:border-box}body{margin:0;padding:20px;font-family:Arial,Helvetica,sans-serif;background:#edf3f8;color:#243447}.box{max-width:520px;margin:45px auto;background:#fff;padding:28px;border-radius:14px;box-shadow:0 4px 18px #00000012}h1{text-align:center;color:#174a7e;margin:0 0 8px}.subtitle{text-align:center;color:#667788;margin-bottom:24px}.warning,.error,.period{padding:12px 14px;border-radius:7px;margin:14px 0;line-height:1.5;overflow-wrap:anywhere}.warning{background:#fff7df;color:#6e5200;border:1px solid #f0d98a}.error{background:#ffe7e7;color:#8c1a1a;border:1px solid #f2bcbc}.period{background:#fff7df;color:#6e5200;border:1px solid #f0d98a}label{display:block;font-weight:bold;margin:14px 0 6px}input{width:100%;padding:12px;border:1px solid #b9c7d5;border-radius:7px;font-size:16px}button,.button{display:inline-block;border:0;border-radius:7px;background:#1769aa;color:white;padding:12px 16px;font-size:16px;cursor:pointer;text-decoration:none;text-align:center}button{width:100%;margin-top:18px}button:hover,.button:hover{background:#104d80}.links{display:flex;gap:10px;flex-wrap:wrap;margin-top:14px}.links .button{flex:1}.small{text-align:center;color:#667788;font-size:13px;margin-top:18px}
-</style></head><body><main class="box"><h1>ESP8266 Data Logger</h1><div class="subtitle">Administrator Login</div>
-<?php if ($adminSessionActive): ?>
-<div class="warning">Administrator session active: <strong><?= h((string)$_SESSION['username']) ?></strong></div><div class="links"><a class="button" href="index2.php">Administrator Dashboard</a><a class="button" href="admin2.php">Manage Devices and View Logs</a><a class="button" href="users.php">Manage Consumers</a><a class="button" href="logout.php">Logout</a></div>
-<?php else: ?>
-<?php if ($error !== ''): ?><div class="error"><strong><?= h($error) ?></strong><?php if ($reason !== ''): ?><br><?= h($reason) ?><?php endif; ?></div><?php endif; ?>
-<?php if ($validFrom !== '' || $validUntil !== ''): ?><div class="period"><strong>Account validity period</strong><br>Valid From: <?= h(ownerDateText($validFrom)) ?><br>Valid Until: <?= h(ownerDateText($validUntil)) ?></div><?php endif; ?>
-<div class="warning">Administrator access is separate from Consumer Login. Consumer accounts cannot open administrator tools.</div>
-<form method="post" action="owner.php" autocomplete="on"><input type="hidden" name="csrf_token" value="<?= h((string)$_SESSION['admin_login_csrf']) ?>"><label for="username">Administrator Username</label><input id="username" name="username" type="text" maxlength="50" autocomplete="username" required autofocus><label for="password">Administrator Password</label><input id="password" name="password" type="password" autocomplete="current-password" required><button type="submit">Administrator Login</button></form>
-<?php endif; ?>
-<div class="small"><a href="index.php">Return to Consumer Login</a></div></main></body></html>
+    $databaseID = $stmt->insert_id;
+    $stmt->close();
+
+    // 15. Success.
+
+    littleFsRespond(200, [
+        'status' => 'success',
+        'message' => 'LittleFS record inserted into espdemo2.logs.',
+        'csv_id' => $csvID,
+        'database_id' => $databaseID,
+        'device_id' => $deviceID,
+        'value1' => $value1,
+        'value2' => $value2,
+        'value3' => $value3,
+        'Date' => $date,
+        'Time' => $time,
+        'TimeStamp' => $timestamp,
+        'timezone' => $timezone,
+        'database_inserted' => true,
+        'already_in_database' => false,
+        'database_saved' => true
+    ]);
+
+} catch (Throwable $e) {
+
+    error_log(
+        'datalogger4_remote sync_littleFS.php: ' .
+        $e->getMessage()
+    );
+
+    littleFsRespond(500, [
+        'status' => 'error',
+        'message' => 'Server or database error. Check Render logs.'
+    ]);
+}
