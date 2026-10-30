@@ -1,598 +1,1205 @@
-<?php
-/*
- * save3_csv.php
- *
- * Project: datalogger3_remote
- * Hosting: Render
- * Database: TiDB Cloud
- * Database name: espdemo2
- *
- * Live ESP8266 endpoint:
- * https://datalogger3-remote.onrender.com/save3_csv.php
- *
- * POST fields:
- * device_id, api_token, value1, value2, value3, timestamp, timezone
- *
- * Required CSV header:
- * id,value1,value2,value3,Date,Time,TimeStamp,timezone,device_id
- *
- * IMPORTANT:
- * 1. config.php must establish the TiDB Cloud connection as $conn.
- * 2. Set ESP_API_TOKEN in the Render environment.
- * 3. The ESP8266 must send the same API token.
- */
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <time.h>
+#include <math.h>
+#include <LittleFS.h>
+#include <SPI.h>
+#include <SD.h>
+#include <vector>
 
-header('Content-Type: application/json; charset=utf-8');
+// =================================================
+// 1. WI-FI SETTINGS
+// =================================================
 
-mysqli_report(MYSQLI_REPORT_OFF);
+// Wi-Fi credentials are stored in LittleFS file /networks.txt.
+// Each record contains three lines: SSID, password, last successful IP.
+const char *NETWORK_FILE = "/networks.txt";
+const char *LOCAL_CSV_FILE = "/sensor_data.csv";  // Stored on SD card
+const char *SYNC_URL =
+  "http://192.168.1.9/datalogger7_local_RSH/sync_sdcard.php";
 
-const CSV_HEADER = [
-    'id',
-    'value1',
-    'value2',
-    'value3',
-    'Date',
-    'Time',
-    'TimeStamp',
-    'timezone',
-    'device_id'
-];
+// ESP32 VSPI: SCK=GPIO18, MISO=GPIO19, MOSI=GPIO23; CS=GPIO5.
+const uint8_t SD_CS_PIN = 5;
+bool sdReady = false;
+const char *CSV_HEADER =
+  "id,value1,value2,value3,Date,Time,TimeStamp,timezone,device_id,CH1,CH2,CH3,CH4,CH5,CH6,CH7,CH8,CH9,CH10,CH11,CH12,CH13,CH14,CH15,CH16";
+unsigned long localCsvNextId = 1;
+struct WifiRecord {
+  String ssid;
+  String password;
+  String lastIP;
+};
+std::vector<WifiRecord> wifiRecords;
+bool littleFSReady = false;
+String serialCommandBuffer = "";
+bool serialPromptActive = false;
 
-/*
- * JSON response helper.
- */
-function respond(int $code, array $body): void
-{
-    http_response_code($code);
+// =================================================
+// 2. FIXED DEVICE ID AND AUTHENTICATION TOKEN
+// =================================================
 
-    echo json_encode(
-        $body,
-        JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE
-    );
+const char *deviceID = "ESP0001";
 
-    exit;
+const char *apiToken = "EspSwitch52026";
+
+// =================================================
+// 3. LOCAL XAMPP PHP URL
+// =================================================
+
+const char *serverURL =
+  "http://192.168.1.9/datalogger7_local_RSH/save3_csv.php";
+
+// =================================================
+// 4. AUTOMATIC GEOLOCATION SERVICE
+// =================================================
+
+const char *geoURL =
+  "http://ip-api.com/json/?fields=status,timezone";
+
+String installationTimezone = "";
+
+// =================================================
+// 5. TIMING SETTINGS
+// =================================================
+
+const unsigned long sendInterval = 5000UL;
+
+const unsigned long timezoneRefreshInterval =
+  6UL * 60UL * 60UL * 1000UL;
+
+const unsigned long timezoneRetryInterval =
+  5UL * 60UL * 1000UL;
+
+unsigned long previousSendTime = 0;
+unsigned long previousTimezoneCheck = 0;
+
+// =================================================
+// 6. CD74HC4067 MULTIPLEXER SETTINGS
+// =================================================
+
+// CD74HC4067 select pins use ESP32 GPIO25/26/27/14; SD uses SPI GPIO18/19/23.
+const uint8_t MUX_S0 = 25;
+const uint8_t MUX_S1 = 26;
+const uint8_t MUX_S2 = 27;
+const uint8_t MUX_S3 = 14;
+// CD74HC4067 SIG/COM connects to ADS1115 A0. ADS1115 connects to ESP32 over I2C.
+// ESP32 default I2C pins: SDA=GPIO21, SCL=GPIO22; default ADS1115 address=0x48.
+const uint8_t I2C_SDA_PIN = 21;
+const uint8_t I2C_SCL_PIN = 22;
+const uint8_t ADS1115_ADDRESS = 0x48;
+const int MUX_CHANNEL_COUNT = 16;
+const unsigned long MUX_SETTLE_DELAY_MS = 3;
+
+// GAIN_SIXTEEN gives +/-0.256 V full-scale and is suitable for low-millivolt signals.
+// Do NOT use this setting if any mux channel can exceed 0.256 V; choose GAIN_ONE
+// ( +/-4.096 V PGA range) instead, while keeping every pin within ADS1115 supply rails.
+Adafruit_ADS1115 ads;
+const adsGain_t ADS_GAIN = GAIN_SIXTEEN;
+bool adsReady = false;
+
+int channelMv[MUX_CHANNEL_COUNT] = {0};
+int adcvalue1 = 0; // CH1 uploaded as value1
+int adcvalue2 = 0; // CH2 uploaded as value2
+int adcvalue3 = 0; // CH3 uploaded as value3
+
+// =================================================
+// WI-FI CREDENTIAL FILE AND SERIAL COMMANDS
+// =================================================
+
+bool loadWifiRecords() {
+  wifiRecords.clear();
+  if (!littleFSReady || !LittleFS.exists(NETWORK_FILE)) return true;
+
+  File file = LittleFS.open(NETWORK_FILE, "r");
+  if (!file) return false;
+
+  while (file.available()) {
+    String networkName = file.readStringUntil('\n');
+    networkName.trim();
+    if (networkName.length() == 0) continue;
+
+    String networkPassword = file.readStringUntil('\n');
+    networkPassword.trim();
+    if (networkPassword.length() == 0) continue;
+
+    String savedIP = file.readStringUntil('\n');
+    savedIP.trim();
+
+    WifiRecord record;
+    record.ssid = networkName;
+    record.password = networkPassword;
+    record.lastIP = savedIP;
+    wifiRecords.push_back(record);
+  }
+  file.close();
+  return true;
 }
 
-/*
- * Write one CSV record.
- */
-function writeCsvRow($fp, array $row): bool
-{
-    return fputcsv($fp, $row) !== false;
+bool saveWifiRecords() {
+  if (!littleFSReady) {
+    Serial.println("ERROR: LittleFS is not available.");
+    return false;
+  }
+  File file = LittleFS.open(NETWORK_FILE, "w");
+  if (!file) {
+    Serial.println("ERROR: Cannot write networks.txt.");
+    return false;
+  }
+  for (size_t i = 0; i < wifiRecords.size(); i++) {
+    file.println(wifiRecords[i].ssid);
+    file.println(wifiRecords[i].password);
+    file.println(wifiRecords[i].lastIP);
+  }
+  file.close();
+  return true;
 }
 
-/*
- * Normalise a CSV header for comparison.
- */
-function normalizedHeader(array $row): array
-{
-    return array_map(
-        static function ($value) {
-            return strtolower(trim((string)$value));
-        },
-        $row
-    );
+String urlEncode(const String &input);
+
+
+String csvEscapeSimple(const String &value) {
+  // Current fields are numeric/date/time/timezone/device ID and contain no commas.
+  return value;
 }
 
-/*
- * Add a record to the CSV file.
- *
- * The CSV ID is the MySQL logs.id value, so a successful database
- * insert and its CSV record share the same identifier.
- *
- * Returns:
- *   ['ok' => true,  'message' => '...']
- *   ['ok' => false, 'message' => '...']
- */
-function appendCsvRecord(
-    string $csvFile,
-    int $id,
-    string $value1,
-    string $value2,
-    string $value3,
-    string $date,
-    string $time,
-    string $timestampUtc,
-    string $timezone,
-    string $deviceId
-): array {
+unsigned long findLastLocalCsvId() {
+  if (!sdReady || !SD.exists(LOCAL_CSV_FILE)) return 0;
+  File f = SD.open(LOCAL_CSV_FILE, FILE_READ);
+  if (!f) return 0;
+  String line;
+  unsigned long lastId = 0;
+  // Skip the header and scan the records. CSV fields used here contain no commas.
+  if (f.available()) line = f.readStringUntil('\n');
+  while (f.available()) {
+    line = f.readStringUntil('\n');
+    line.trim();
+    if (!line.length()) continue;
+    int comma = line.indexOf(',');
+    if (comma > 0) {
+      unsigned long id = (unsigned long)line.substring(0, comma).toInt();
+      if (id > lastId) lastId = id;
+    }
+  }
+  f.close();
+  return lastId;
+}
 
-    $fp = @fopen($csvFile, 'c+');
+// Copy an existing SD file to a backup, verify its size, then remove the original.
+// This avoids SD.rename(), which is unavailable in some ESP32 SD libraries.
+bool backupAndRemoveFile(const char *sourcePath, const char *backupPath) {
+  if (!SD.exists(sourcePath) || SD.exists(backupPath)) return false;
 
-    if ($fp === false) {
-        return [
-            'ok' => false,
-            'message' => 'Cannot open CSV file. Check the configured storage path and permissions.'
-        ];
+  File source = SD.open(sourcePath, FILE_READ);
+  if (!source) return false;
+  const size_t originalSize = source.size();
+
+  File backup = SD.open(backupPath, FILE_WRITE);
+  if (!backup) {
+    source.close();
+    return false;
+  }
+
+  uint8_t buffer[128];
+  bool copyOK = true;
+  while (source.available()) {
+    int bytesRead = source.read(buffer, sizeof(buffer));
+    if (bytesRead <= 0) break;
+    size_t bytesWritten = backup.write(buffer, (size_t)bytesRead);
+    if (bytesWritten != (size_t)bytesRead) {
+      copyOK = false;
+      break;
+    }
+  }
+
+  backup.flush();
+  backup.close();
+  source.close();
+
+  File verify = SD.open(backupPath, FILE_READ);
+  if (!verify) copyOK = false;
+  else {
+    if (verify.size() != originalSize) copyOK = false;
+    verify.close();
+  }
+
+  if (!copyOK) {
+    SD.remove(backupPath);
+    Serial.println("ERROR: Backup copy failed verification; original CSV was kept.");
+    return false;
+  }
+
+  if (!SD.remove(sourcePath)) {
+    Serial.println("ERROR: Backup was created, but original CSV could not be removed.");
+    Serial.println("Original data and backup should both remain on the SD card.");
+    return false;
+  }
+
+  return true;
+}
+
+bool initializeLocalCsv() {
+  if (!sdReady) {
+    Serial.println("ERROR: SD card is not available.");
+    return false;
+  }
+
+  // If no CSV exists, create it with the required 25-column header.
+  if (!SD.exists(LOCAL_CSV_FILE)) {
+    File f = SD.open(LOCAL_CSV_FILE, FILE_WRITE);
+    if (!f) {
+      Serial.println("ERROR: Cannot create /sensor_data.csv on SD card.");
+      return false;
+    }
+    f.println(CSV_HEADER);
+    f.close();
+    Serial.println("Created new SD card sensor_data.csv with the 25-column header.");
+  } else {
+    // Check the first line before appending any readings.
+    File f = SD.open(LOCAL_CSV_FILE, FILE_READ);
+    if (!f) {
+      Serial.println("ERROR: Cannot read sensor_data.csv on SD card.");
+      return false;
     }
 
-    if (!flock($fp, LOCK_EX)) {
-        fclose($fp);
+    String header = f.readStringUntil('\n');
+    header.trim();
+    f.close();
 
-        return [
-            'ok' => false,
-            'message' => 'Could not lock CSV file.'
-        ];
+    if (header != CSV_HEADER) {
+      Serial.println("WARNING: Existing SD card sensor_data.csv has an unexpected header.");
+      Serial.println("The old file will be renamed to a backup; its contents will be preserved.");
+
+      // Choose an unused backup name so an earlier backup is never overwritten.
+      String backupPath = "/sensor_data_backup.csv";
+      unsigned int backupNumber = 1;
+
+      while (SD.exists(backupPath.c_str()) && backupNumber < 1000) {
+        backupPath = "/sensor_data_backup_" + String(backupNumber) + ".csv";
+        backupNumber++;
+      }
+
+      if (SD.exists(backupPath.c_str())) {
+        Serial.println("ERROR: Could not find an unused backup filename.");
+        Serial.println("No file was renamed or overwritten.");
+        return false;
+      }
+
+      if (!backupAndRemoveFile(LOCAL_CSV_FILE, backupPath.c_str())) {
+        Serial.println("ERROR: Could not safely back up the old sensor_data.csv.");
+        Serial.println("No new sensor_data.csv was created; check SD card space and write access.");
+        return false;
+      }
+
+      Serial.print("Old CSV copied to backup: ");
+      Serial.println(backupPath);
+
+      // Create a fresh CSV with the expected 25 columns.
+      File newFile = SD.open(LOCAL_CSV_FILE, FILE_WRITE);
+      if (!newFile) {
+        Serial.println("ERROR: Old file was backed up, but new sensor_data.csv could not be created.");
+        Serial.println("The old data remains in the backup file.");
+        return false;
+      }
+
+      size_t headerBytes = newFile.println(CSV_HEADER);
+      newFile.flush();
+      newFile.close();
+
+      if (headerBytes == 0) {
+        Serial.println("ERROR: Could not write the new CSV header.");
+        return false;
+      }
+
+      Serial.println("Created a new sensor_data.csv with the correct 25-column header.");
     }
+  }
 
-    rewind($fp);
+  localCsvNextId = findLastLocalCsvId() + 1;
+  Serial.print("SD card CSV ready. Next local ID: ");
+  Serial.println(localCsvNextId);
+  return true;
+}
 
-    $firstRow = fgetcsv($fp);
+String posixTimezoneForIana(const String &iana) {
+  // Common timezone mappings. Add mappings as required for deployment locations.
+  if (iana == "Asia/Kolkata" || iana == "Asia/Calcutta") return "IST-5:30";
+  if (iana == "Asia/Kathmandu") return "NPT-5:45";
+  if (iana == "Asia/Dubai") return "GST-4";
+  if (iana == "Asia/Singapore") return "SGT-8";
+  if (iana == "Asia/Tokyo") return "JST-9";
+  if (iana == "Asia/Shanghai" || iana == "Asia/Hong_Kong") return "CST-8";
+  if (iana == "UTC" || iana == "Etc/UTC" || iana == "Etc/GMT") return "UTC0";
+  if (iana == "Europe/London") return "GMT0BST,M3.5.0/1,M10.5.0";
+  if (iana == "Europe/Paris" || iana == "Europe/Berlin" || iana == "Europe/Rome") return "CET-1CEST,M3.5.0,M10.5.0/3";
+  if (iana == "America/New_York") return "EST5EDT,M3.2.0,M11.1.0";
+  if (iana == "America/Chicago") return "CST6CDT,M3.2.0,M11.1.0";
+  if (iana == "America/Denver") return "MST7MDT,M3.2.0,M11.1.0";
+  if (iana == "America/Los_Angeles") return "PST8PDT,M3.2.0,M11.1.0";
+  if (iana == "Australia/Sydney") return "AEST-10AEDT,M10.1.0,M4.1.0/3";
+  return "";
+}
 
-    $isEmpty = (
-        $firstRow === false ||
-        (
-            count($firstRow) === 1 &&
-            trim((string)$firstRow[0]) === ''
-        )
-    );
+bool appendLocalCsvRecord(const int values[16], time_t utcTimestamp,
+                          const String &timezone, const String &devId) {
+  if (!sdReady || !initializeLocalCsv()) return false;
 
-    if ($isEmpty) {
+  time_t raw = utcTimestamp;
+  struct tm *utcTm = gmtime(&raw);
+  if (!utcTm) return false;
 
-        /*
-         * Create the canonical header in a new empty CSV file.
-         */
-        ftruncate($fp, 0);
-        rewind($fp);
+  char stamp[24];
+  snprintf(stamp, sizeof(stamp), "%04d-%02d-%02d %02d:%02d:%02d",
+           utcTm->tm_year + 1900, utcTm->tm_mon + 1, utcTm->tm_mday,
+           utcTm->tm_hour, utcTm->tm_min, utcTm->tm_sec);
 
-        if (!writeCsvRow($fp, CSV_HEADER)) {
-            flock($fp, LOCK_UN);
-            fclose($fp);
+  String posixTZ = posixTimezoneForIana(timezone);
+  if (posixTZ.length() == 0) {
+    Serial.println("WARNING: Unknown timezone conversion rule; using UTC for local Date/Time.");
+    posixTZ = "UTC0";
+  }
+  setenv("TZ", posixTZ.c_str(), 1);
+  tzset();
+  struct tm *localTm = localtime(&raw);
+  if (!localTm) return false;
 
-            return [
-                'ok' => false,
-                'message' => 'Could not write CSV header.'
-            ];
-        }
+  char dateBuf[12], timeBuf[10];
+  snprintf(dateBuf, sizeof(dateBuf), "%04d-%02d-%02d",
+           localTm->tm_year + 1900, localTm->tm_mon + 1, localTm->tm_mday);
+  snprintf(timeBuf, sizeof(timeBuf), "%02d:%02d:%02d",
+           localTm->tm_hour, localTm->tm_min, localTm->tm_sec);
+
+  File f = SD.open(LOCAL_CSV_FILE, FILE_WRITE);
+  if (!f) {
+    Serial.println("ERROR: Cannot append to SD card sensor_data.csv.");
+    return false;
+  }
+
+  // First 9 fields are compatible with sync_sdcard.php and espdemo2.logs.
+  // value1-value3 duplicate CH1-CH3 so the existing database is unchanged.
+  String row = String(localCsvNextId) + "," +
+               String(values[0]) + "," + String(values[1]) + "," +
+               String(values[2]) + "," + dateBuf + "," + timeBuf + "," +
+               stamp + "," + timezone + "," + devId;
+  for (int i = 0; i < 16; i++) {
+    row += ",";
+    row += String(values[i]);
+  }
+
+  size_t written = f.println(row);
+  f.flush();
+  f.close();
+  if (written == 0) return false;
+
+  Serial.print("Saved all 16 channels on SD card. Local CSV ID: ");
+  Serial.println(localCsvNextId);
+  localCsvNextId++;
+  return true;
+}
+
+void showLocalCsvStatus() {
+  if (!sdReady || !SD.exists(LOCAL_CSV_FILE)) {
+    Serial.println("SD card sensor_data.csv is not available.");
+    return;
+  }
+  File f = SD.open(LOCAL_CSV_FILE, FILE_READ);
+  if (!f) {
+    Serial.println("Cannot open local CSV file.");
+    return;
+  }
+  unsigned long lines = 0;
+  while (f.available()) {
+    String line = f.readStringUntil('\n');
+    if (line.length()) lines++;
+  }
+  f.close();
+  Serial.print("SD card CSV file: "); Serial.println(LOCAL_CSV_FILE);
+  Serial.print("Header plus records: "); Serial.println(lines);
+  Serial.print("Saved data records: "); Serial.println(lines > 0 ? lines - 1 : 0);
+  Serial.print("Next local ID: "); Serial.println(localCsvNextId);
+}
+
+bool postSdCardRecord(const String &line) {
+  // Local CSV has 25 columns: 9 compatible fields + CH1..CH16.
+  // Only the first 9 are sent; the existing logs table stores CH1-CH3.
+  String fields[25];
+  int fieldCount = 0;
+  int start = 0;
+  for (int i = 0; i <= (int)line.length(); i++) {
+    if (i == (int)line.length() || line[i] == ',') {
+      if (fieldCount >= 25) return false;
+      fields[fieldCount++] = line.substring(start, i);
+      start = i + 1;
+    }
+  }
+  if (fieldCount != 25) {
+    Serial.print("Skipping malformed SD CSV row; columns found: ");
+    Serial.println(fieldCount);
+    return false;
+  }
+
+  String form = "api_token=" + urlEncode(String(apiToken)) +
+      "&csv_id=" + urlEncode(fields[0]) +
+      "&value1=" + urlEncode(fields[1]) +
+      "&value2=" + urlEncode(fields[2]) +
+      "&value3=" + urlEncode(fields[3]) +
+      "&Date=" + urlEncode(fields[4]) +
+      "&Time=" + urlEncode(fields[5]) +
+      "&TimeStamp=" + urlEncode(fields[6]) +
+      "&timezone=" + urlEncode(fields[7]) +
+      "&device_id=" + urlEncode(fields[8]);
+
+  WiFiClient client;
+  HTTPClient http;
+  if (!http.begin(client, SYNC_URL)) return false;
+  http.setTimeout(15000);
+  http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+  int code = http.POST(form);
+  String response = http.getString();
+  http.end();
+  Serial.print("Sync HTTP code: "); Serial.println(code);
+  Serial.println(response);
+  return code == HTTP_CODE_OK;
+}
+
+void uploadSdCardCsv() {
+  if (!sdReady || !SD.exists(LOCAL_CSV_FILE)) {
+    Serial.println("SD card CSV file is missing or SD card is not ready.");
+    return;
+  }
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("Wi-Fi is not connected. Cannot transfer records now.");
+    return;
+  }
+  File f = SD.open(LOCAL_CSV_FILE, FILE_READ);
+  if (!f) {
+    Serial.println("Cannot open SD card CSV file.");
+    return;
+  }
+  String header = f.readStringUntil('\n');
+  header.trim();
+  if (header != CSV_HEADER) {
+    Serial.println("Unexpected SD card CSV header. Upload cancelled.");
+    f.close();
+    return;
+  }
+  unsigned long attempted = 0, succeeded = 0, failed = 0;
+  Serial.println("Transferring SD card records to XAMPP; existing server records are deduplicated.");
+  while (f.available()) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (!line.length()) continue;
+    attempted++;
+    if (postSdCardRecord(line)) succeeded++;
+    else failed++;
+    delay(100);
+    yield();
+  }
+  f.close();
+  Serial.println("------ SD CARD TRANSFER SUMMARY ------");
+  Serial.print("Records attempted: "); Serial.println(attempted);
+  Serial.print("Requests successful: "); Serial.println(succeeded);
+  Serial.print("Requests failed: "); Serial.println(failed);
+  Serial.println("If any failed, correct the issue and run UPLOAD SD CARD again.");
+  Serial.println("---------------------------------------");
+}
+
+void showHelp() {
+  Serial.println();
+  Serial.println("=========== COMMANDS ===========");
+  Serial.println("HELP          - Show commands");
+  Serial.println("SHOW NETWORKS - List SSIDs and saved IPs");
+  Serial.println("READ FILE     - Read networks.txt (shows passwords)");
+  Serial.println("SET WIFI      - Append a WiFi credential");
+  Serial.println("EDIT WIFI     - Edit a record by number");
+  Serial.println("DELETE WIFI   - Delete a record by number");
+  Serial.println("CLEAR WIFI    - Delete all credentials");
+  Serial.println("SHOW WIFI     - Show current WiFi connection");
+  Serial.println("SHOW CSV      - Show local CSV record count");
+  Serial.println("UPLOAD SD CARD - Transfer SD CSV records to XAMPP");
+  Serial.println("SD stores all 16 channels; logs table receives CH1-CH3.");
+  Serial.println("STATUS        - Show status");
+  Serial.println("RESTART       - Restart ESP32");
+  Serial.println("================================");
+}
+
+void showNetworks() {
+  loadWifiRecords();
+  Serial.println();
+  Serial.println("------ SAVED WI-FI NETWORKS ------");
+  if (wifiRecords.empty()) {
+    Serial.println("No saved Wi-Fi credentials.");
+  } else {
+    for (size_t i = 0; i < wifiRecords.size(); i++) {
+      Serial.print(i + 1);
+      Serial.print(". SSID: ");
+      Serial.print(wifiRecords[i].ssid);
+      Serial.print(" | Saved IP: ");
+      Serial.println(wifiRecords[i].lastIP.length() ? wifiRecords[i].lastIP : "(not connected yet)");
+    }
+  }
+  Serial.println("----------------------------------");
+}
+
+void readNetworkFile() {
+  loadWifiRecords();
+  Serial.println();
+  Serial.println("------ networks.txt (passwords visible) ------");
+  if (wifiRecords.empty()) {
+    Serial.println("File is empty or no valid records.");
+  } else {
+    for (size_t i = 0; i < wifiRecords.size(); i++) {
+      Serial.print("Record "); Serial.println(i + 1);
+      Serial.print("SSID: "); Serial.println(wifiRecords[i].ssid);
+      Serial.print("Password: "); Serial.println(wifiRecords[i].password);
+      Serial.print("Last successful IP: "); Serial.println(wifiRecords[i].lastIP);
+      Serial.println("---");
+    }
+  }
+  Serial.println("----------------------------------------------");
+}
+
+bool connectToSavedNetworks() {
+  if (!loadWifiRecords()) {
+    Serial.println("Could not read networks.txt.");
+    return false;
+  }
+  if (wifiRecords.empty()) {
+    Serial.println("No saved Wi-Fi credentials. Use SET WIFI.");
+    return false;
+  }
+
+  WiFi.mode(WIFI_STA);
+  for (size_t i = 0; i < wifiRecords.size(); i++) {
+    Serial.println();
+    Serial.print("Trying Wi-Fi record "); Serial.print(i + 1);
+    Serial.print(": "); Serial.println(wifiRecords[i].ssid);
+    WiFi.disconnect();
+    delay(200);
+    WiFi.begin(wifiRecords[i].ssid.c_str(), wifiRecords[i].password.c_str());
+
+    unsigned long started = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - started < 12000UL) {
+      delay(250);
+      Serial.print(".");
+      // Still allow the user to enter a command while waiting.
+      if (Serial.available()) break;
+    }
+    Serial.println();
+
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.print("Connected to: "); Serial.println(WiFi.SSID());
+      Serial.print("ESP32 IP: "); Serial.println(WiFi.localIP());
+      wifiRecords[i].lastIP = WiFi.localIP().toString();
+      saveWifiRecords();
+      return true;
+    }
+    Serial.println("This network did not connect; trying the next saved network.");
+  }
+  Serial.println("Could not connect to any saved Wi-Fi network.");
+  return false;
+}
+
+String readSerialLine(const char *promptText) {
+  Serial.println(promptText);
+  String result = "";
+  unsigned long started = millis();
+  while (millis() - started < 120000UL) {
+    while (Serial.available()) {
+      char c = (char)Serial.read();
+      if (c == '\r') continue;
+      if (c == '\n') {
+        result.trim();
+        return result;
+      }
+      if (result.length() < 120) result += c;
+    }
+    delay(10);
+  }
+  Serial.println("Input timed out.");
+  return "";
+}
+
+void setWifiRecord() {
+  String newSSID = readSerialLine("Enter Wi-Fi SSID:");
+  if (!newSSID.length()) { Serial.println("SSID cannot be empty."); return; }
+  String newPassword = readSerialLine("Enter Wi-Fi password:");
+  if (!newPassword.length()) { Serial.println("Password cannot be empty."); return; }
+
+  loadWifiRecords();
+  for (size_t i = 0; i < wifiRecords.size(); i++) {
+    if (wifiRecords[i].ssid == newSSID && wifiRecords[i].password == newPassword) {
+      Serial.println("This SSID/password is already saved.");
+      return;
+    }
+  }
+  WifiRecord record;
+  record.ssid = newSSID;
+  record.password = newPassword;
+  record.lastIP = "";
+  wifiRecords.push_back(record);
+  if (!saveWifiRecords()) return;
+  Serial.println("Wi-Fi credential appended to networks.txt.");
+  Serial.println("Trying the newly added network...");
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  WiFi.begin(newSSID.c_str(), newPassword.c_str());
+  unsigned long started = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - started < 15000UL) {
+    delay(250); Serial.print(".");
+  }
+  Serial.println();
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("Connected. IP: "); Serial.println(WiFi.localIP());
+    for (size_t i = 0; i < wifiRecords.size(); i++) {
+      if (wifiRecords[i].ssid == newSSID && wifiRecords[i].password == newPassword) {
+        wifiRecords[i].lastIP = WiFi.localIP().toString();
+        break;
+      }
+    }
+    saveWifiRecords();
+  } else {
+    Serial.println("Connection failed. Credential retained for future retries.");
+  }
+}
+
+int askRecordNumber(const char *promptText) {
+  String answer = readSerialLine(promptText);
+  int number = answer.toInt();
+  if (number < 1 || number > (int)wifiRecords.size()) return -1;
+  return number - 1;
+}
+
+void editWifiRecord() {
+  loadWifiRecords();
+  showNetworks();
+  if (wifiRecords.empty()) return;
+  int index = askRecordNumber("Enter record number to edit:");
+  if (index < 0) { Serial.println("Invalid record number."); return; }
+  String newSSID = readSerialLine("Enter new SSID:");
+  if (!newSSID.length()) { Serial.println("SSID cannot be empty."); return; }
+  String newPassword = readSerialLine("Enter new password:");
+  if (!newPassword.length()) { Serial.println("Password cannot be empty."); return; }
+  wifiRecords[index].ssid = newSSID;
+  wifiRecords[index].password = newPassword;
+  wifiRecords[index].lastIP = "";
+  if (saveWifiRecords()) Serial.println("Record updated.");
+}
+
+void deleteWifiRecord() {
+  loadWifiRecords();
+  showNetworks();
+  if (wifiRecords.empty()) return;
+  int index = askRecordNumber("Enter record number to delete:");
+  if (index < 0) { Serial.println("Invalid record number."); return; }
+  wifiRecords.erase(wifiRecords.begin() + index);
+  if (saveWifiRecords()) Serial.println("Record deleted.");
+}
+
+void clearWifiRecords() {
+  if (!littleFSReady) { Serial.println("LittleFS is not available."); return; }
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_STA);
+  wifiRecords.clear();
+  if (LittleFS.exists(NETWORK_FILE)) LittleFS.remove(NETWORK_FILE);
+  Serial.println("All saved Wi-Fi credentials deleted.");
+}
+
+void showWifi() {
+  Serial.println();
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("Wi-Fi status: CONNECTED");
+    Serial.print("SSID: "); Serial.println(WiFi.SSID());
+    Serial.print("IP address: "); Serial.println(WiFi.localIP());
+    Serial.print("Signal strength (RSSI): "); Serial.print(WiFi.RSSI()); Serial.println(" dBm");
+  } else {
+    Serial.println("Wi-Fi status: DISCONNECTED");
+  }
+}
+
+void showStatus() {
+  Serial.println();
+  Serial.println("========== DEVICE STATUS ==========");
+  Serial.print("Device ID: "); Serial.println(deviceID);
+  Serial.println("Analog input: ADS1115 + CD74HC4067 16-channel multiplexer");
+  Serial.print("ADS1115: "); Serial.println(adsReady ? "READY" : "NOT FOUND");
+  Serial.print("LittleFS: "); Serial.println(littleFSReady ? "READY" : "NOT AVAILABLE");
+  Serial.print("Saved Wi-Fi records: "); Serial.println(wifiRecords.size());
+  Serial.println("Multiplexer: configured for 16 channels");
+  showLocalCsvStatus();
+  showWifi();
+  Serial.print("Installation timezone: ");
+  Serial.println(installationTimezone.length() ? installationTimezone : "(not detected)");
+  time_t now = time(nullptr);
+  Serial.print("UTC Unix timestamp: "); Serial.println((unsigned long)now);
+  Serial.println("===================================");
+}
+
+void handleSerialCommands() {
+  while (Serial.available()) {
+    char c = (char)Serial.read();
+    if (c == '\r') continue;
+    if (c == '\n') {
+      serialCommandBuffer.trim();
+      String command = serialCommandBuffer;
+      serialCommandBuffer = "";
+      command.toUpperCase();
+      if (!command.length()) continue;
+
+      if (command == "HELP") showHelp();
+      else if (command == "SHOW NETWORKS" || command == "SHOW NETWORK") showNetworks();
+      else if (command == "READ FILE") readNetworkFile();
+      else if (command == "SET WIFI") setWifiRecord();
+      else if (command == "EDIT WIFI") editWifiRecord();
+      else if (command == "DELETE WIFI") deleteWifiRecord();
+      else if (command == "CLEAR WIFI") clearWifiRecords();
+      else if (command == "SHOW WIFI") showWifi();
+      else if (command == "SHOW CSV") showLocalCsvStatus();
+      else if (command == "UPLOAD SD CARD" || command == "SYNC SD CARD") uploadSdCardCsv();
+      else if (command == "STATUS") showStatus();
+      else if (command == "RESTART") {
+        Serial.println("Restarting ESP32...");
+        delay(500);
+        ESP.restart();
+      } else {
+        Serial.println("Unknown command. Type HELP.");
+      }
+    } else if (serialCommandBuffer.length() < 100) {
+      serialCommandBuffer += c;
+    }
+  }
+}
+
+
+// =================================================
+// 7. URL ENCODING
+// =================================================
+
+String urlEncode(const String &input) {
+
+  String output = "";
+  const char hex[] = "0123456789ABCDEF";
+
+  for (unsigned int i = 0; i < input.length(); i++) {
+
+    unsigned char c = input[i];
+
+    if ((c >= 'A' && c <= 'Z') ||
+        (c >= 'a' && c <= 'z') ||
+        (c >= '0' && c <= '9') ||
+        c == '-' || c == '_' ||
+        c == '.' || c == '~') {
+
+      output += (char)c;
 
     } else {
 
-        /*
-         * Do not silently overwrite or destroy an existing file
-         * whose header does not match the required format.
-         */
-        if (
-            normalizedHeader($firstRow) !==
-            normalizedHeader(CSV_HEADER)
-        ) {
-            flock($fp, LOCK_UN);
-            fclose($fp);
-
-            return [
-                'ok' => false,
-                'message' =>
-                    'CSV header is not recognised. Back up the existing file before correcting it.'
-            ];
-        }
-
-        /*
-         * Avoid appending the same database ID twice if a previous
-         * request wrote the CSV but its response was lost.
-         */
-        while (($row = fgetcsv($fp)) !== false) {
-
-            if (
-                isset($row[0]) &&
-                ctype_digit(trim((string)$row[0])) &&
-                (int)$row[0] === $id
-            ) {
-                flock($fp, LOCK_UN);
-                fclose($fp);
-
-                return [
-                    'ok' => true,
-                    'message' => 'CSV record already exists.',
-                    'already_present' => true
-                ];
-            }
-        }
+      output += '%';
+      output += hex[c >> 4];
+      output += hex[c & 0x0F];
     }
+  }
 
-    /*
-     * Append the record in the required column order.
-     */
-    fseek($fp, 0, SEEK_END);
-
-    $written = writeCsvRow($fp, [
-        $id,
-        $value1,
-        $value2,
-        $value3,
-        $date,
-        $time,
-        $timestampUtc,
-        $timezone,
-        $deviceId
-    ]);
-
-    if ($written) {
-        $written = fflush($fp);
-    }
-
-    flock($fp, LOCK_UN);
-    fclose($fp);
-
-    if (!$written) {
-        return [
-            'ok' => false,
-            'message' => 'Failed to write or flush the CSV record.'
-        ];
-    }
-
-    return [
-        'ok' => true,
-        'message' => 'CSV record saved.',
-        'already_present' => false
-    ];
+  return output;
 }
 
+// =================================================
+// 8. DETECT INSTALLATION TIMEZONE
+// =================================================
 
-/* =========================================================
- * 1. Validate the HTTP request
- * =========================================================
- */
+bool detectTimezone() {
 
-if (($_SERVER['REQUEST_METHOD'] ?? '') !== 'POST') {
-    respond(405, [
-        'status' => 'error',
-        'message' => 'POST request required.'
-    ]);
-}
+  Serial.println();
+  Serial.println("Checking installation timezone...");
 
+  WiFiClient client;
+  HTTPClient http;
 
-/* =========================================================
- * 2. Validate the API token
- * =========================================================
- */
+  if (!http.begin(client, geoURL)) {
 
-$expectedToken = (string)getenv('ESP_API_TOKEN');
-
-if ($expectedToken === '') {
-    respond(500, [
-        'status' => 'error',
-        'message' => 'ESP_API_TOKEN is not configured on the server.'
-    ]);
-}
-
-$providedToken = (string)($_POST['api_token'] ?? '');
-
-if (!hash_equals($expectedToken, $providedToken)) {
-    respond(403, [
-        'status' => 'error',
-        'message' => 'Invalid API token.'
-    ]);
-}
-
-
-/* =========================================================
- * 3. Read and validate the sensor data
- * =========================================================
- */
-
-$deviceId = trim((string)($_POST['device_id'] ?? ''));
-
-$value1 = trim((string)($_POST['value1'] ?? ''));
-$value2 = trim((string)($_POST['value2'] ?? ''));
-$value3 = trim((string)($_POST['value3'] ?? ''));
-
-$timestampRaw = trim((string)($_POST['timestamp'] ?? ''));
-$timezone = trim((string)($_POST['timezone'] ?? ''));
-
-if (
-    $deviceId === '' ||
-    $timestampRaw === '' ||
-    $timezone === ''
-) {
-    respond(400, [
-        'status' => 'error',
-        'message' => 'device_id, timestamp and timezone are required.'
-    ]);
-}
-
-if (
-    strlen($deviceId) > 32 ||
-    strlen($value1) > 30 ||
-    strlen($value2) > 30 ||
-    strlen($value3) > 50 ||
-    strlen($timezone) > 64
-) {
-    respond(400, [
-        'status' => 'error',
-        'message' => 'One or more fields exceed the permitted length.'
-    ]);
-}
-
-/*
- * Require a positive integer Unix timestamp.
- */
-if (
-    !preg_match('/^[0-9]{1,12}$/', $timestampRaw) ||
-    (float)$timestampRaw <= 0
-) {
-    respond(400, [
-        'status' => 'error',
-        'message' => 'Invalid Unix timestamp.'
-    ]);
-}
-
-$unixTimestamp = (int)$timestampRaw;
-
-/*
- * Validate the installation timezone.
- * Example: Asia/Kolkata
- */
-try {
-    $tz = new DateTimeZone($timezone);
-} catch (Throwable $e) {
-    respond(400, [
-        'status' => 'error',
-        'message' => 'Invalid timezone.'
-    ]);
-}
-
-/*
- * Convert UTC Unix time to the installation-local date/time.
- */
-$localDateTime = (
-    new DateTimeImmutable('@' . $unixTimestamp)
-)->setTimezone($tz);
-
-$date = $localDateTime->format('Y-m-d');
-$time = $localDateTime->format('H:i:s');
-
-/*
- * Store the database timestamp in UTC.
- */
-$timestampUtc = gmdate(
-    'Y-m-d H:i:s',
-    $unixTimestamp
-);
-
-
-/* =========================================================
- * 4. Connect to TiDB Cloud using the existing config.php
- * =========================================================
- */
-
-$configFile = __DIR__ . '/config.php';
-
-if (!is_file($configFile)) {
-    respond(500, [
-        'status' => 'error',
-        'message' => 'config.php was not found.'
-    ]);
-}
-
-require_once $configFile;
-
-/*
- * This endpoint expects config.php to provide a connected
- * MySQLi object named $conn.
- */
-if (
-    !isset($conn) ||
-    !($conn instanceof mysqli) ||
-    $conn->connect_errno
-) {
-    respond(500, [
-        'status' => 'error',
-        'message' => 'TiDB database connection is unavailable.'
-    ]);
-}
-
-if (!$conn->set_charset('utf8mb4')) {
-    respond(500, [
-        'status' => 'error',
-        'message' => 'Could not set the database character set.'
-    ]);
-}
-
-/*
- * Ensure TIMESTAMP input and output use UTC for this connection.
- */
-if (!$conn->query("SET time_zone = '+00:00'")) {
-    respond(500, [
-        'status' => 'error',
-        'message' => 'Could not set the database session timezone to UTC.'
-    ]);
-}
-
-
-/* =========================================================
- * 5. Check for an existing reading before inserting
- * =========================================================
- *
- * This helps avoid duplicates when the ESP8266 retries the
- * same reading with the same device ID and UTC timestamp.
- *
- * It assumes one reading per device per second. If your
- * hardware can legitimately send multiple readings for the
- * same device within one second, use a unique reading ID
- * generated by the firmware instead.
- */
-
-$existingId = null;
-
-$check = $conn->prepare(
-    'SELECT id
-       FROM logs
-      WHERE device_id = ?
-        AND TimeStamp = ?
-      ORDER BY id ASC
-      LIMIT 1'
-);
-
-if (!$check) {
-    respond(500, [
-        'status' => 'error',
-        'message' => 'Could not prepare the duplicate-reading check.'
-    ]);
-}
-
-$check->bind_param(
-    'ss',
-    $deviceId,
-    $timestampUtc
-);
-
-if (!$check->execute()) {
-    $check->close();
-
-    respond(500, [
-        'status' => 'error',
-        'message' => 'Could not check for an existing reading.'
-    ]);
-}
-
-$check->bind_result($foundId);
-
-if ($check->fetch()) {
-    $existingId = (int)$foundId;
-}
-
-$check->close();
-
-$databaseId = null;
-$databaseAlreadyHadRecord = false;
-
-
-/* =========================================================
- * 6. Insert into espdemo2.logs if this reading is new
- * =========================================================
- */
-
-if ($existingId !== null) {
-
-    $databaseId = $existingId;
-    $databaseAlreadyHadRecord = true;
-
-} else {
-
-    $stmt = $conn->prepare(
-        'INSERT INTO logs
-            (value1, value2, value3, Date, Time,
-             TimeStamp, timezone, device_id)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+    Serial.println(
+      "Could not start geolocation request."
     );
 
-    if (!$stmt) {
-        respond(500, [
-            'status' => 'error',
-            'message' => 'Could not prepare the logs insert.'
-        ]);
-    }
+    return false;
+  }
 
-    $stmt->bind_param(
-        'ssssssss',
-        $value1,
-        $value2,
-        $value3,
-        $date,
-        $time,
-        $timestampUtc,
-        $timezone,
-        $deviceId
+  http.setTimeout(10000);
+
+  int httpCode = http.GET();
+
+  if (httpCode != HTTP_CODE_OK) {
+
+    Serial.print("Geolocation HTTP error: ");
+    Serial.println(httpCode);
+
+    http.end();
+    return false;
+  }
+
+  String response = http.getString();
+  http.end();
+
+  Serial.println("Geolocation response:");
+  Serial.println(response);
+
+  if (response.indexOf("\"status\":\"success\"") < 0) {
+
+    Serial.println(
+      "Geolocation request was unsuccessful."
     );
 
-    if (!$stmt->execute()) {
-        $stmt->close();
+    return false;
+  }
 
-        respond(500, [
-            'status' => 'error',
-            'message' => 'Failed to insert the reading into espdemo2.logs.'
-        ]);
+  String key = "\"timezone\":\"";
+  int start = response.indexOf(key);
+
+  if (start < 0) {
+
+    Serial.println("Timezone field not found.");
+    return false;
+  }
+
+  start += key.length();
+
+  int finish = response.indexOf("\"", start);
+
+  if (finish < 0) {
+
+    Serial.println("Invalid timezone response.");
+    return false;
+  }
+
+  String detected = response.substring(start, finish);
+  detected.trim();
+
+  if (detected.length() == 0 ||
+      detected.indexOf('/') < 0) {
+
+    Serial.println("Invalid timezone returned.");
+    return false;
+  }
+
+  installationTimezone = detected;
+
+  Serial.print("Detected timezone: ");
+  Serial.println(installationTimezone);
+
+  return true;
+}
+
+// =================================================
+// 9. SYNCHRONIZE UTC TIME USING NTP
+// =================================================
+
+bool synchronizeTime() {
+
+  Serial.println();
+  Serial.println("Synchronizing UTC time using NTP...");
+
+  configTime(
+    0,
+    0,
+    "pool.ntp.org",
+    "time.nist.gov"
+  );
+
+  for (int i = 0; i < 30; i++) {
+
+    time_t now = time(nullptr);
+
+    if (now > 1700000000) {
+
+      Serial.println(
+        "NTP synchronization successful."
+      );
+
+      Serial.print("UTC Unix timestamp: ");
+      Serial.println((unsigned long)now);
+
+      return true;
     }
 
-    $databaseId = (int)$stmt->insert_id;
+    Serial.print(".");
+    delay(1000);
+  }
 
-    $stmt->close();
+  Serial.println();
+  Serial.println("NTP synchronization failed.");
+
+  return false;
 }
 
+// =================================================
+// 10. READ ALL 16 MULTIPLEXER CHANNELS
+// =================================================
 
-/* =========================================================
- * 7. Save the same reading to the CSV file
- * =========================================================
- *
- * By default, the file is stored beside this PHP file.
- *
- * To use a persistent Render disk, set CSV_FILE_PATH to a
- * file path on that disk in the Render environment.
- */
-
-$configuredCsvPath = trim((string)getenv('CSV_FILE_PATH'));
-
-if ($configuredCsvPath !== '') {
-    $csvFile = $configuredCsvPath;
-} else {
-    $csvFile = __DIR__ . '/sensor_data.csv';
+void selectMuxChannel(uint8_t channel) {
+  digitalWrite(MUX_S0, (channel >> 0) & 0x01);
+  digitalWrite(MUX_S1, (channel >> 1) & 0x01);
+  digitalWrite(MUX_S2, (channel >> 2) & 0x01);
+  digitalWrite(MUX_S3, (channel >> 3) & 0x01);
 }
 
-$csvDirectory = dirname($csvFile);
+bool readMultiplexer() {
+  if (!adsReady) {
+    Serial.println("ERROR: ADS1115 is not initialized; cannot read sensors.");
+    return false;
+  }
 
-if (!is_dir($csvDirectory) || !is_writable($csvDirectory)) {
+  Serial.println();
+  Serial.println("----- CD74HC4067 + ADS1115 16-CHANNEL READINGS -----");
 
-    respond(500, [
-        'status' => 'partial_success',
-        'message' => 'Database saved, but the CSV directory is unavailable.',
-        'database_saved' => true,
-        'csv_saved' => false,
-        'mysql_id' => $databaseId,
-        'device_id' => $deviceId
-    ]);
+  for (uint8_t channel = 0; channel < MUX_CHANNEL_COUNT; channel++) {
+    selectMuxChannel(channel);
+    delay(MUX_SETTLE_DELAY_MS);
+    (void)ads.readADC_SingleEnded(0); // discard first conversion after mux switching
+    delay(2);
+    int16_t raw = ads.readADC_SingleEnded(0);
+    float volts = ads.computeVolts(raw);
+    if (volts < 0.0f) volts = 0.0f;
+    channelMv[channel] = (int)lroundf(volts * 1000.0f);
+
+    Serial.print("CH");
+    Serial.print(channel + 1);
+    Serial.print(" (C");
+    Serial.print(channel);
+    Serial.print("): raw=");
+    Serial.print(raw);
+    Serial.print(", voltage=");
+    Serial.print(volts, 6);
+    Serial.print(" V, ");
+    Serial.print(volts * 1000.0f, 3);
+    Serial.println(" mV");
+    delay(1);
+  }
+
+  // CH1-CH3 are sent to existing database fields value1-value3 in millivolts.
+  adcvalue1 = channelMv[0];
+  adcvalue2 = channelMv[1];
+  adcvalue3 = channelMv[2];
+
+  Serial.println("----- SELECTED VALUES FOR EXISTING DATABASE -----");
+  Serial.print("value1 = CH1 = "); Serial.print(adcvalue1); Serial.println(" mV");
+  Serial.print("value2 = CH2 = "); Serial.print(adcvalue2); Serial.println(" mV");
+  Serial.print("value3 = CH3 = "); Serial.print(adcvalue3); Serial.println(" mV");
+  return true;
 }
 
-$csvResult = appendCsvRecord(
-    $csvFile,
-    $databaseId,
-    $value1,
-    $value2,
-    $value3,
-    $date,
-    $time,
-    $timestampUtc,
-    $timezone,
-    $deviceId
-);
+// =================================================
+// 11. SETUP
+// =================================================
 
+void setup() {
 
-/* =========================================================
- * 8. Return the result to the ESP8266
- * =========================================================
- */
+  Serial.begin(115200);
+  delay(1000);
 
-if (!$csvResult['ok']) {
+  Serial.println();
+  Serial.println("==================================");
+  Serial.println("ESP32 ADS1115 + CD74HC4067 DATA LOGGER - SD CARD");
+  Serial.println("Fixed Device ID: ESP0001");
+  Serial.println("Project: datalogger7_local");
+  Serial.println("==================================");
 
-    respond(500, [
-        'status' => 'partial_success',
-        'message' => 'Database saved, but the CSV operation failed.',
-        'database_saved' => true,
-        'csv_saved' => false,
-        'mysql_id' => $databaseId,
-        'device_id' => $deviceId,
-        'csv_error' => $csvResult['message'],
-        'hint' => 'Check CSV_FILE_PATH, directory permissions and the existing CSV header.'
-    ]);
+  // Configure CD74HC4067 select pins GPIO25/26/27/14.
+  pinMode(MUX_S0, OUTPUT);
+  pinMode(MUX_S1, OUTPUT);
+  pinMode(MUX_S2, OUTPUT);
+  pinMode(MUX_S3, OUTPUT);
+  digitalWrite(MUX_S0, LOW);
+  digitalWrite(MUX_S1, LOW);
+  digitalWrite(MUX_S2, LOW);
+  digitalWrite(MUX_S3, LOW);
+  Serial.println("CD74HC4067 select pins initialized.");
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+  if (ads.begin(ADS1115_ADDRESS, &Wire)) {
+    ads.setGain(ADS_GAIN);
+    ads.setDataRate(RATE_ADS1115_128SPS);
+    adsReady = true;
+    Serial.println("ADS1115 initialized successfully at I2C address 0x48.");
+    Serial.println("CD74HC4067 SIG/COM must connect to ADS1115 A0.");
+    Serial.println("ADS1115 gain: GAIN_SIXTEEN (+/-0.256 V full-scale) for millivolt signals.");
+  } else {
+    adsReady = false;
+    Serial.println("ERROR: ADS1115 not found. Check SDA/SCL, power, GND, and address.");
+  }
+
+  // Mount LittleFS and load Wi-Fi credentials.
+  littleFSReady = LittleFS.begin();
+  if (!littleFSReady) {
+    Serial.println("ERROR: LittleFS mount failed. Wi-Fi commands cannot save credentials.");
+  } else {
+    Serial.println("LittleFS mounted successfully.");
+    if (!LittleFS.exists(NETWORK_FILE)) {
+      File newFile = LittleFS.open(NETWORK_FILE, "w");
+      if (newFile) newFile.close();
+    }
+    loadWifiRecords();
+    connectToSavedNetworks();
+  }
+
+  Serial.println();
+  Serial.println("Type HELP in Serial Monitor for available commands.");
+  Serial.println("Serial Monitor line ending: Newline.");
+
+  Serial.print("Fixed device ID: ");
+  Serial.println(deviceID);
+
+  Serial.print("CSV PHP endpoint: ");
+  Serial.println(serverURL);
+
+  // Initialize SD card for sensor_data.csv. LittleFS remains reserved for Wi-Fi credentials.
+  SPI.begin(18, 19, 23, SD_CS_PIN);  // SCK, MISO, MOSI, SS
+  if (SD.begin(SD_CS_PIN)) {
+    sdReady = true;
+    Serial.println("SD card initialized successfully.");
+    initializeLocalCsv();
+  } else {
+    sdReady = false;
+    Serial.println("ERROR: SD card initialization failed.");
+    Serial.println("Check SD wiring, FAT32 formatting, power, and CS=GPIO5.");
+    Serial.println("Live readings can still be sent to XAMPP when Wi-Fi is available.");
+  }
+
+  // Detect installation timezone.
+
+  bool timezoneOK = detectTimezone();
+
+  previousTimezoneCheck = millis();
+
+  if (!timezoneOK) {
+
+    Serial.println(
+      "Timezone detection will be retried."
+    );
+  }
+
+  // Synchronize UTC clock.
+
+  synchronizeTime();
 }
 
-respond(200, [
-    'status' => 'success',
-    'message' => $databaseAlreadyHadRecord
-        ? 'Reading already existed in the database; CSV checked.'
-        : 'Reading saved to the database and CSV.',
-    'mysql_id' => $databaseId,
-    'csv_id' => $databaseId,
-    'database_saved' => true,
-    'csv_saved' => true,
-    'duplicate_database_record' => $databaseAlreadyHadRecord,
-    'csv_record_already_present' => $csvResult['already_present'] ?? false,
-    'device_id' => $deviceId,
-    'value1' => $value1,
-    'value2' => $value2,
-    'value3' => $value3,
-    'Date' => $date,
-    'Time' => $time,
-    'TimeStamp' => $timestampUtc,
-    'timezone' => $timezone
-]);
-?>
+// =================================================
+// 12. MAIN LOOP
+// =================================================
 
+void loop() {
+
+  handleSerialCommands();
+
+  bool wifiConnected = (WiFi.status() == WL_CONNECTED);
+  if (!wifiConnected) {
+    static unsigned long lastReconnectAttempt = 0;
+    if (millis() - lastReconnectAttempt >= 15000UL) {
+      lastReconnectAttempt = millis();
+      Serial.println("Wi-Fi disconnected. Trying saved credentials in order...");
+      connectToSavedNetworks();
+      wifiConnected = (WiFi.status() == WL_CONNECTED);
+    }
+  }
+
+  unsigned long nowMillis = millis();
+
+  // -----------------------------------------------
+  // Refresh timezone automatically
+  // -----------------------------------------------
+
+  unsigned long refreshInterval =
+    installationTimezone.length() == 0
+      ? timezoneRetryInterval
+      : timezoneRefreshInterval;
+
+  if (wifiConnected && nowMillis - previousTimezoneCheck >=
+      refreshInterval) {
+
+    previousTimezoneCheck = nowMillis;
+
+    if (!detectTimezone()) {
+
+      Serial.println(
+        "Timezone refresh failed."
+      );
+    }
+  }
+
+  // -----------------------------------------------
+  // Send data every 5 seconds
+  // -----------------------------------------------
+
+  if (nowMillis - previousSendTime < sendInterval) {
+    return;
+  }
+
+  previousSendTime = nowMillis;
+
+  if (installationTimezone.length() == 0) {
+    if (wifiConnected) {
+      Serial.println("Timezone not detected yet; will retry.");
+    } else {
+      Serial.println("Local save skipped: timezone is not available yet.");
+    }
+    return;
+  }
+
+  // Verify UTC time. Once synchronized, the clock continues while Wi-Fi is temporarily down.
+  time_t utcTimestamp = time(nullptr);
+  if (utcTimestamp <= 1700000000) {
+    Serial.println("UTC clock is invalid; NTP synchronization requires Wi-Fi.");
+    if (!wifiConnected || !synchronizeTime()) {
+      Serial.println("Reading skipped until valid time is available.");
+      return;
+    }
+    utcTimestamp = time(nullptr);
+  }
+
+  if (!readMultiplexer()) return;
+
+  Serial.println();
+  Serial.println("----------------------------------");
+  Serial.println("Saving 16-channel multiplexer scan to SD card and, if online, XAMPP");
+  Serial.print("Device ID: "); Serial.println(deviceID);
+  Serial.print("UTC timestamp: "); Serial.println((unsigned long)utcTimestamp);
+  Serial.print("Timezone: "); Serial.println(installationTimezone);
+
+  bool localSaved = appendLocalCsvRecord(
+    channelMv, utcTimestamp, installationTimezone, String(deviceID));
+
+  if (!localSaved) {
+    Serial.println("ERROR: Reading was not saved to SD card.");
+  }
+
+  if (!wifiConnected) {
+    Serial.println("Wi-Fi offline: reading retained on SD card; use UPLOAD SD CARD when connected.");
+    return;
+  }
+
+  String postData =
+    "device_id=" + urlEncode(String(deviceID)) +
+    "&api_token=" + urlEncode(String(apiToken)) +
+    "&value1=" + String(adcvalue1) +
+    "&value2=" + String(adcvalue2) +
+    "&value3=" + String(adcvalue3) +
+    "&timestamp=" + String((unsigned long)utcTimestamp) +
+    "&timezone=" + urlEncode(installationTimezone);
+
+  WiFiClient client;
+  HTTPClient http;
+  if (http.begin(client, serverURL)) {
+    http.setTimeout(10000);
+    http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+    int httpCode = http.POST(postData);
+    Serial.print("HTTP response code: "); Serial.println(httpCode);
+    if (httpCode > 0) {
+      Serial.println("CSV/database endpoint response:");
+      Serial.println(http.getString());
+    } else {
+      Serial.print("HTTP error: ");
+      Serial.println(http.errorToString(httpCode));
+      Serial.println("SD card copy is retained for later transfer.");
+    }
+    http.end();
+  } else {
+    Serial.println("Could not initialize HTTP connection. SD card copy is retained.");
+  }
+}
