@@ -1,240 +1,226 @@
 <?php
 /*
- * Remote SD-card synchronization endpoint for Render + TiDB Cloud.
- * Required Render variable: API_TOKEN
- * Database connection is provided by config.php.
+ * ESP32 Data Logger 4 Remote
+ *
+ * Endpoint: /sync_sdcard.php
+ *
+ * Receives records from the ESP32 SD CSV file.
+ *
+ * POST fields:
+ * api_token, csv_id, value1, value2, value3,
+ * Date, Time, TimeStamp, timezone, device_id
+ *
+ * Database: espdemo2
+ * Table: logs
+ *
+ * Database columns:
+ * id, value1, value2, value3, Date, Time,
+ * TimeStamp, timezone, device_id
  */
+
+header('Content-Type: application/json; charset=UTF-8');
+header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
 
 require_once __DIR__ . '/config.php';
 
-header('Content-Type: application/json; charset=utf-8');
-
-$apiToken = dataLoggerEnv('ESP_API_TOKEN', ''); 
-
-$csvFile = __DIR__ . DIRECTORY_SEPARATOR . 'sensor_data.csv';
-$header = [
-    'id', 'value1', 'value2', 'value3',
-    'Date', 'Time', 'TimeStamp', 'timezone', 'device_id'
-];
-
-function syncRespond(int $code, array $body): void {
-    http_response_code($code);
-    echo json_encode($body, JSON_UNESCAPED_SLASHES);
+function syncRespond(int $status, array $data): void
+{
+    http_response_code($status);
+    echo json_encode(
+        $data,
+        JSON_UNESCAPED_SLASHES | JSON_PRETTY_PRINT
+    );
     exit;
 }
 
-if (($_SERVER['REQUEST_METHOD'] ?? '') !== 'POST') {
-    syncRespond(405, [
-        'status' => 'error',
-        'message' => 'POST request required.'
-    ]);
-}
-
-if (
-    $apiToken === '' ||
-    !hash_equals($apiToken, (string)($_POST['api_token'] ?? ''))
-) {
-    syncRespond(403, [
-        'status' => 'error',
-        'message' => 'Invalid API token.'
-    ]);
-}
-
-$csvId = trim((string)($_POST['csv_id'] ?? ''));
-$value1 = trim((string)($_POST['value1'] ?? ''));
-$value2 = trim((string)($_POST['value2'] ?? ''));
-$value3 = trim((string)($_POST['value3'] ?? ''));
-$date = trim((string)($_POST['Date'] ?? ''));
-$time = trim((string)($_POST['Time'] ?? ''));
-$timestamp = trim((string)($_POST['TimeStamp'] ?? ''));
-$timezone = trim((string)($_POST['timezone'] ?? ''));
-$deviceId = trim((string)($_POST['device_id'] ?? ''));
-
-if (
-    $csvId === '' || !ctype_digit($csvId) ||
-    $deviceId === '' || $date === '' || $time === '' ||
-    $timestamp === '' || $timezone === ''
-) {
-    syncRespond(400, [
-        'status' => 'error',
-        'message' => 'Missing or invalid CSV record fields.'
-    ]);
-}
-
-if (
-    strlen($deviceId) > 32 ||
-    strlen($value1) > 30 ||
-    strlen($value2) > 30 ||
-    strlen($value3) > 50 ||
-    strlen($timezone) > 64
-) {
-    syncRespond(400, [
-        'status' => 'error',
-        'message' => 'One or more fields exceed the logs-table field length.'
-    ]);
-}
-
-if (
-    !preg_match('/^\d{4}-\d{2}-\d{2}$/', $date) ||
-    !preg_match('/^\d{2}:\d{2}:\d{2}$/', $time) ||
-    !preg_match('/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/', $timestamp)
-) {
-    syncRespond(400, [
-        'status' => 'error',
-        'message' => 'Date, Time or TimeStamp format is invalid.'
-    ]);
-}
-
 try {
-    new DateTimeZone($timezone);
-} catch (Throwable $e) {
-    syncRespond(400, [
-        'status' => 'error',
-        'message' => 'Invalid timezone.'
-    ]);
-}
 
-/*
- * TimeStamp represents UTC. Set the MySQL session timezone to UTC
- * before checking or inserting TIMESTAMP values.
- */
-try {
-    $conn->query("SET time_zone = '+00:00'");
+    // 1. Accept POST requests only.
+    if (($_SERVER['REQUEST_METHOD'] ?? '') !== 'POST') {
+        header('Allow: POST');
 
-    $check = $conn->prepare(
-        'SELECT id FROM `logs`
-         WHERE `device_id` = ? AND `TimeStamp` = ?
+        syncRespond(405, [
+            'status' => 'error',
+            'message' => 'POST request required.'
+        ]);
+    }
+
+    // 2. Read and validate device credentials.
+    $deviceID = trim((string)($_POST['device_id'] ?? ''));
+    $apiToken = trim((string)($_POST['api_token'] ?? ''));
+
+    if (
+        $deviceID === '' ||
+        $apiToken === '' ||
+        !preg_match('/^[A-Za-z0-9_-]{1,32}$/', $deviceID)
+    ) {
+        syncRespond(400, [
+            'status' => 'error',
+            'message' => 'Missing or invalid device credentials.'
+        ]);
+    }
+
+    // 3. Verify the registered ESP device.
+    $stmt = $conn->prepare(
+        'SELECT token_hash, enabled
+         FROM esp_devices
+         WHERE device_id = ?
          LIMIT 1'
     );
 
-    $check->bind_param('ss', $deviceId, $timestamp);
-    $check->execute();
-    $check->store_result();
-
-    $existsInDb = ($check->num_rows > 0);
-    $check->close();
-
-    $dbInserted = false;
-    $dbId = null;
-
-    if (!$existsInDb) {
-        $stmt = $conn->prepare(
-            'INSERT INTO `logs`
-            (`value1`,`value2`,`value3`,`Date`,`Time`,
-             `TimeStamp`,`timezone`,`device_id`)
-            VALUES (?,?,?,?,?,?,?,?)'
+    if (!$stmt) {
+        throw new RuntimeException(
+            'Could not prepare device authentication query.'
         );
-
-        $stmt->bind_param(
-            'ssssssss',
-            $value1,
-            $value2,
-            $value3,
-            $date,
-            $time,
-            $timestamp,
-            $timezone,
-            $deviceId
-        );
-
-        $stmt->execute();
-
-        $dbInserted = true;
-        $dbId = $stmt->insert_id;
-        $stmt->close();
     }
-} catch (Throwable $e) {
-    error_log('SD-card sync database error: ' . $e->getMessage());
 
-    syncRespond(500, [
-        'status' => 'error',
-        'message' => 'Database operation failed. Check Render and TiDB Cloud settings.'
-    ]);
-}
+    $stmt->bind_param('s', $deviceID);
 
-/* Open and lock the server CSV. */
-$fp = @fopen($csvFile, 'c+');
+    if (!$stmt->execute()) {
+        throw new RuntimeException(
+            'Device authentication query failed.'
+        );
+    }
 
-if ($fp === false) {
-    syncRespond(500, [
-        'status' => 'error',
-        'message' => 'Cannot create/open server sensor_data.csv. Check folder permissions.'
-    ]);
-}
+    $result = $stmt->get_result();
+    $device = $result->fetch_assoc();
+    $stmt->close();
 
-if (!flock($fp, LOCK_EX)) {
-    fclose($fp);
+    $storedHash = is_array($device)
+        ? (string)($device['token_hash'] ?? '')
+        : '';
 
-    syncRespond(500, [
-        'status' => 'error',
-        'message' => 'Could not lock server CSV file.'
-    ]);
-}
+    $submittedHash = hash('sha256', $apiToken);
 
-rewind($fp);
-$first = fgetcsv($fp);
-$csvExists = false;
-$lastCsvId = 0;
-
-if (
-    $first === false ||
-    (count($first) === 1 && trim((string)$first[0]) === '')
-) {
-    ftruncate($fp, 0);
-    rewind($fp);
-
-    if (fputcsv($fp, $header) === false) {
-        flock($fp, LOCK_UN);
-        fclose($fp);
-
-        syncRespond(500, [
+    if (
+        !$device ||
+        (int)($device['enabled'] ?? 0) !== 1 ||
+        $storedHash === '' ||
+        !hash_equals($storedHash, $submittedHash)
+    ) {
+        syncRespond(403, [
             'status' => 'error',
-            'message' => 'Could not write the CSV header.'
+            'message' => 'Device is not authorized.'
         ]);
     }
-} else {
-    $normalized = array_map(
-        static fn($x) => strtolower(trim((string)$x)),
-        $first
+
+    // 4. Read the original SD CSV record.
+    $csvID = trim((string)($_POST['csv_id'] ?? ''));
+
+    $value1 = trim((string)($_POST['value1'] ?? ''));
+    $value2 = trim((string)($_POST['value2'] ?? ''));
+    $value3 = trim((string)($_POST['value3'] ?? ''));
+
+    $date = trim((string)($_POST['Date'] ?? ''));
+    $time = trim((string)($_POST['Time'] ?? ''));
+    $timestamp = trim((string)($_POST['TimeStamp'] ?? ''));
+    $timezone = trim((string)($_POST['timezone'] ?? ''));
+
+    // 5. Validate the CSV ID.
+    if ($csvID === '' || !ctype_digit($csvID)) {
+        syncRespond(400, [
+            'status' => 'error',
+            'message' => 'Invalid csv_id.'
+        ]);
+    }
+
+    // 6. Validate sensor values and field lengths.
+    if (
+        $value1 === '' ||
+        $value2 === '' ||
+        $value3 === '' ||
+        strlen($value1) > 30 ||
+        strlen($value2) > 30 ||
+        strlen($value3) > 50
+    ) {
+        syncRespond(400, [
+            'status' => 'error',
+            'message' => 'Missing sensor values or field length exceeded.'
+        ]);
+    }
+
+    // 7. Validate Date, Time and TimeStamp formats.
+    $validDate = DateTimeImmutable::createFromFormat(
+        '!Y-m-d',
+        $date
     );
 
-    if ($normalized !== array_map('strtolower', $header)) {
-        flock($fp, LOCK_UN);
-        fclose($fp);
-
-        syncRespond(409, [
+    if (
+        !$validDate ||
+        $validDate->format('Y-m-d') !== $date
+    ) {
+        syncRespond(400, [
             'status' => 'error',
-            'message' => 'Server sensor_data.csv header is not in the required logs-table order.',
-            'required_header' => $header
+            'message' => 'Invalid Date. Expected YYYY-MM-DD.'
         ]);
     }
 
-    while (($row = fgetcsv($fp)) !== false) {
-        if (isset($row[0]) && is_numeric($row[0])) {
-            $lastCsvId = max($lastCsvId, (int)$row[0]);
-        }
-
-        if (
-            count($row) >= 9 &&
-            (string)$row[7] === $timezone &&
-            (string)$row[8] === $deviceId &&
-            (string)$row[6] === $timestamp
-        ) {
-            $csvExists = true;
-        }
+    if (
+        !preg_match(
+            '/^(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d$/',
+            $time
+        )
+    ) {
+        syncRespond(400, [
+            'status' => 'error',
+            'message' => 'Invalid Time. Expected HH:MM:SS.'
+        ]);
     }
-}
 
-$csvAppended = false;
-$serverCsvId = null;
+    $validTimestamp = DateTimeImmutable::createFromFormat(
+        '!Y-m-d H:i:s',
+        $timestamp
+    );
 
-if (!$csvExists) {
-    $serverCsvId = $lastCsvId + 1;
+    if (
+        !$validTimestamp ||
+        $validTimestamp->format('Y-m-d H:i:s') !== $timestamp
+    ) {
+        syncRespond(400, [
+            'status' => 'error',
+            'message' => 'Invalid TimeStamp. Expected YYYY-MM-DD HH:MM:SS.'
+        ]);
+    }
 
-    fseek($fp, 0, SEEK_END);
+    // 8. Validate the installation timezone.
+    if (
+        $timezone === '' ||
+        strlen($timezone) > 64 ||
+        !in_array(
+            $timezone,
+            DateTimeZone::listIdentifiers(),
+            true
+        )
+    ) {
+        syncRespond(400, [
+            'status' => 'error',
+            'message' => 'Invalid installation timezone.'
+        ]);
+    }
 
-    if (fputcsv($fp, [
-        $serverCsvId,
+    // 9. Insert the record into the remote TiDB Cloud database.
+    //
+    // The database generates its own id.
+    // csv_id is the local SD CSV ID, not the database primary key.
+    //
+    // This assumes config.php connects to the correct TiDB Cloud
+    // database and the logs.id column is AUTO_INCREMENT.
+
+    $stmt = $conn->prepare(
+        'INSERT INTO logs
+            (value1, value2, value3, `Date`, `Time`,
+             `TimeStamp`, timezone, device_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+    );
+
+    if (!$stmt) {
+        throw new RuntimeException(
+            'Could not prepare logs insertion.'
+        );
+    }
+
+    $stmt->bind_param(
+        'ssssssss',
         $value1,
         $value2,
         $value3,
@@ -242,33 +228,54 @@ if (!$csvExists) {
         $time,
         $timestamp,
         $timezone,
-        $deviceId
-    ]) === false) {
-        flock($fp, LOCK_UN);
-        fclose($fp);
+        $deviceID
+    );
+
+    if (!$stmt->execute()) {
+        $error = $stmt->error;
+        $stmt->close();
+
+        error_log(
+            'SD sync database insert failed: ' . $error
+        );
 
         syncRespond(500, [
             'status' => 'error',
-            'message' => 'Could not append record to server sensor_data.csv.'
+            'message' => 'Database insertion failed.',
+            'csv_id' => $csvID,
+            'device_id' => $deviceID
         ]);
     }
 
-    fflush($fp);
-    $csvAppended = true;
+    $databaseID = $stmt->insert_id;
+    $stmt->close();
+
+    // 10. Return success only after a successful insertion.
+    syncRespond(200, [
+        'status' => 'success',
+        'message' => 'SD record inserted into espdemo2.logs.',
+        'csv_id' => $csvID,
+        'database_id' => $databaseID,
+        'device_id' => $deviceID,
+        'value1' => $value1,
+        'value2' => $value2,
+        'value3' => $value3,
+        'Date' => $date,
+        'Time' => $time,
+        'TimeStamp' => $timestamp,
+        'timezone' => $timezone,
+        'database_saved' => true
+    ]);
+
+} catch (Throwable $e) {
+
+    error_log(
+        'datalogger4_remote sync_sdcard.php: ' .
+        $e->getMessage()
+    );
+
+    syncRespond(500, [
+        'status' => 'error',
+        'message' => 'Server or database error. Check Render logs.'
+    ]);
 }
-
-flock($fp, LOCK_UN);
-fclose($fp);
-
-syncRespond(200, [
-    'status' => 'success',
-    'message' => 'SD card record synchronized; duplicates were skipped.',
-    'device_id' => $deviceId,
-    'timestamp' => $timestamp,
-    'csv_appended' => $csvAppended,
-    'server_csv_id' => $serverCsvId,
-    'database_inserted' => $dbInserted,
-    'mysql_id' => $dbId,
-    'already_in_database' => $existsInDb
-]);
-?>
