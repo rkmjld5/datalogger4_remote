@@ -30,7 +30,7 @@ const char *LOCAL_CSV_FILE = "/sensor_data.csv";
 
 // Render endpoints MUST use HTTPS. Using HTTP caused HTTP 307 redirects.
 const char *SYNC_URL =
-  "https://datalogger4-remote.onrender.com/sync_littleFS.php";
+  "https://datalogger4-remote.onrender.com/sync_littlefs.php";
 const char *serverURL =
   "https://datalogger4-remote.onrender.com/save3_csv.php";
 const char *geoURL =
