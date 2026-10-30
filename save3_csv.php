@@ -1,4 +1,3 @@
-
 <?php
 /*
  * ESP32 Data Logger 4 Remote
