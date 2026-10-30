@@ -16,6 +16,7 @@
 */
 
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <time.h>
 #include <math.h>
@@ -29,10 +30,11 @@
 const char *NETWORK_FILE = "/networks.txt";
 const char *LOCAL_CSV_FILE = "/sensor_data.csv";
 
+// Render endpoints MUST use HTTPS. Using HTTP caused HTTP 307 redirects.
 const char *SYNC_URL =
-  "http://192.168.1.9/datalogger7_local_RSH/sync_sdcard.php";
+  "https://datalogger4-remote.onrender.com/sync_sdcard.php";
 const char *serverURL =
-  "http://192.168.1.9/datalogger7_local_RSH/save3_csv.php";
+  "https://datalogger4-remote.onrender.com/save3_csv.php";
 const char *geoURL =
   "http://ip-api.com/json/?fields=status,timezone";
 
@@ -810,11 +812,17 @@ bool postSdCardRecord(const String &line) {
     "&timezone=" + urlEncode(fields[7]) +
     "&device_id=" + urlEncode(fields[8]);
 
-  WiFiClient client;
+  // HTTPS connection to Render. setInsecure() is for testing only;
+  // it encrypts the connection but does not verify the server certificate.
+  WiFiClientSecure client;
+  client.setInsecure();
   HTTPClient http;
-  if (!http.begin(client, SYNC_URL)) return false;
+  if (!http.begin(client, SYNC_URL)) {
+    Serial.println("Could not initialize HTTPS connection to SD sync endpoint.");
+    return false;
+  }
 
-  http.setTimeout(15000);
+  http.setTimeout(30000);
   http.addHeader("Content-Type", "application/x-www-form-urlencoded");
 
   int code = http.POST(form);
@@ -859,7 +867,7 @@ void uploadSdCardCsv() {
   unsigned long succeeded = 0;
   unsigned long failed = 0;
 
-  Serial.println("Uploading 9-column SD records to XAMPP...");
+  Serial.println("Uploading 9-column SD records to Render...");
 
   while (f.available()) {
     String line = f.readStringUntil('\n');
@@ -1150,7 +1158,7 @@ void loop() {
   readMultiplexer();
 
   Serial.println("\n----------------------------------");
-  Serial.println("Saving 16-channel scan to SD and, if online, XAMPP");
+  Serial.println("Saving 16-channel scan to SD and, if online, Render");
   Serial.print("Device ID: "); Serial.println(deviceID);
   Serial.print("UTC timestamp: "); Serial.println((unsigned long)utcTimestamp);
   Serial.print("Timezone: "); Serial.println(installationTimezone);
@@ -1178,11 +1186,14 @@ void loop() {
     "&timestamp=" + String((unsigned long)utcTimestamp) +
     "&timezone=" + urlEncode(installationTimezone);
 
-  WiFiClient client;
+  // HTTPS connection to Render. setInsecure() is for testing only;
+  // install/validate the server CA certificate for production use.
+  WiFiClientSecure client;
+  client.setInsecure();
   HTTPClient http;
 
   if (http.begin(client, serverURL)) {
-    http.setTimeout(10000);
+    http.setTimeout(30000);
     http.addHeader("Content-Type", "application/x-www-form-urlencoded");
 
     int httpCode = http.POST(postData);
@@ -1200,7 +1211,7 @@ void loop() {
 
     http.end();
   } else {
-    Serial.println("Could not initialize HTTP connection.");
+    Serial.println("Could not initialize HTTPS connection to Render.");
     Serial.println("SD card copy is retained.");
   }
 }
