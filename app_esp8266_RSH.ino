@@ -28,9 +28,9 @@
 const char *NETWORK_FILE = "/networks.txt";  // LittleFS, Wi-Fi credentials only
 const char *SD_CSV_FILE = "/sensor_data.csv"; // SD card, 25-column readings
 const char *LITTLEFS_CSV_FILE = "/sensor_data.csv"; // LittleFS, 9-column readings
-const char *SYNC_SD_URL = "https://datalogger5-remote.onrender.com/sync_sdcard.php";
-const char *SYNC_LITTLEFS_URL = "https://datalogger5-remote.onrender.com/sync_littlefs.php";
-const char *SERVER_URL = "https://datalogger5-remote.onrender.com/save3_csv.php";
+const char *SYNC_SD_URL = "https://datalogger4-remote.onrender.com/sync_sdcard.php";
+const char *SYNC_LITTLEFS_URL = "https://datalogger4-remote.onrender.com/sync_littlefs.php";
+const char *SERVER_URL = "https://datalogger4-remote.onrender.com/save3_csv.php";
 const char *GEO_URL = "http://ip-api.com/json/?fields=status,timezone";
 const char *SD_CSV_HEADER = "id,value1,value2,value3,Date,Time,TimeStamp,timezone,device_id,CH1,CH2,CH3,CH4,CH5,CH6,CH7,CH8,CH9,CH10,CH11,CH12,CH13,CH14,CH15,CH16";
 const char *LITTLEFS_CSV_HEADER = "id,value1,value2,value3,Date,Time,TimeStamp,timezone,device_id";
